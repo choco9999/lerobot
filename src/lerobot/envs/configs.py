@@ -208,6 +208,9 @@ class ResetConfig:
     reset_time_s: float = 5.0
     control_time_s: float = 20.0
     terminate_on_success: bool = True
+    # If True, the actor will pause after each episode and ask the user to label
+    # the outcome (success/failure) before resetting.
+    prompt_success_failure: bool = False
 
 
 @dataclass

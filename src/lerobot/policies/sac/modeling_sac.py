@@ -29,9 +29,18 @@ from torch import Tensor
 from torch.distributions import MultivariateNormal, TanhTransform, Transform, TransformedDistribution
 
 from lerobot.policies.pretrained import PreTrainedPolicy
-from lerobot.policies.sac.configuration_sac import SACConfig, is_image_feature
+from lerobot.policies.sac.configuration_sac import SACActConfig, SACConfig, is_image_feature
 from lerobot.policies.utils import get_device_from_parameters
-from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_STATE
+from lerobot.configs.types import NormalizationMode
+from lerobot.utils.constants import (
+    ACTION,
+    OBS_ENV_STATE,
+    OBS_IMAGE,
+    OBS_IMAGES,
+    OBS_STATE,
+    POLICY_PREPROCESSOR_DEFAULT_NAME,
+    POLICY_POSTPROCESSOR_DEFAULT_NAME,
+ )
 
 DISCRETE_DIMENSION_INDEX = -1  # Gripper is always the last dimension
 
@@ -1061,3 +1070,353 @@ class TanhMultivariateNormalDiag(TransformedDistribution):
             x = transform(x)
 
         return x
+
+
+class _ACTGaussianActor(nn.Module):
+    """Stochastic tanh-Gaussian actor backed by a pretrained ACT model (mean provider)."""
+
+    def __init__(
+        self,
+        *,
+        act_policy: nn.Module,
+        act_image_features: list[str],
+        action_dim: int,
+        action_index: int = 0,
+        init_std: float = 0.2,
+        preprocessor: object | None = None,
+        postprocessor: object | None = None,
+        action_min: list[float] | None = None,
+        action_max: list[float] | None = None,
+        act_action_norm_mode: NormalizationMode | None = None,
+    ) -> None:
+        super().__init__()
+        self.act_policy = act_policy
+        self.act_image_features = list(act_image_features)
+        self.action_index = int(action_index)
+        self.preprocessor = preprocessor
+        self.postprocessor = postprocessor
+        self.act_action_norm_mode = act_action_norm_mode
+
+        if (action_min is None) != (action_max is None):
+            raise ValueError("action_min and action_max must be provided together (or both be None).")
+        if action_min is not None and action_max is not None:
+            if len(action_min) != action_dim or len(action_max) != action_dim:
+                raise ValueError(
+                    f"Action dim mismatch for action_min/action_max: expected {action_dim} values, "
+                    f"got min={len(action_min)} max={len(action_max)}."
+                )
+            self.register_buffer(
+                "_action_min",
+                torch.tensor(action_min, dtype=torch.float32),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_action_max",
+                torch.tensor(action_max, dtype=torch.float32),
+                persistent=False,
+            )
+        else:
+            self._action_min = None  # type: ignore[assignment]
+            self._action_max = None  # type: ignore[assignment]
+
+        if init_std <= 0:
+            raise ValueError(f"init_std must be > 0, got {init_std}")
+        self.log_std = nn.Parameter(torch.full((action_dim,), math.log(init_std), dtype=torch.float32))
+
+    def train(self, mode: bool = True):
+        # Keep ACT in eval mode even when fine-tuning with RL:
+        # - avoids the VAE training-only assertion requiring ACTION in batch
+        # - keeps dropout disabled for stability
+        super().train(mode)
+        if isinstance(self.act_policy, nn.Module):
+            self.act_policy.eval()
+        return self
+
+    def reset(self) -> None:
+        reset_fn = getattr(self.act_policy, "reset", None)
+        if callable(reset_fn):
+            reset_fn()
+
+    def _act_batch(self, observations: dict[str, Tensor]) -> dict[str, Tensor]:
+        batch: dict[str, Tensor] = observations
+        if self.preprocessor is not None:
+            batch = self.preprocessor(batch)
+
+        if self.act_image_features:
+            batch = dict(batch)
+            missing = [key for key in self.act_image_features if key not in batch]
+            if missing:
+                available_images = sorted(
+                    key
+                    for key in batch.keys()
+                    if key == OBS_IMAGE or key.startswith(f"{OBS_IMAGES}.") or key.startswith(f"{OBS_IMAGE}.")
+                )
+                raise KeyError(
+                    "Missing image features required by the ACT checkpoint: "
+                    f"{missing}. Available image keys in the current batch: {available_images}. "
+                    "Make sure your environment/camera names and `policy.input_features` match the ACT "
+                    "`act_pretrained_path` config.json."
+                )
+
+            batch[OBS_IMAGES] = [batch[key] for key in self.act_image_features]
+        return batch
+
+    def _predict_act_action(self, batch: dict[str, Tensor], *, use_action_queue: bool) -> Tensor:
+        """Return a single ACT action (B, D) in ACT output space."""
+        if use_action_queue:
+            select_action = getattr(self.act_policy, "select_action", None)
+            if callable(select_action):
+                action = select_action(batch)
+                if not isinstance(action, torch.Tensor):
+                    raise TypeError(f"ACT policy select_action() must return a torch.Tensor, got {type(action)}")
+                return action
+
+        act_model = getattr(self.act_policy, "model", None)
+        if not isinstance(act_model, nn.Module):
+            raise TypeError("ACT policy is missing a `.model` nn.Module.")
+
+        actions_seq, _ = act_model(batch)
+        # Best-effort cache of the latest predicted chunk for logging/debugging. This is useful when
+        # `use_action_queue` is False (otherwise ACTPolicy.select_action manages chunking internally).
+        if hasattr(self.act_policy, "_last_action_chunk"):
+            try:
+                setattr(self.act_policy, "_last_action_chunk", actions_seq)
+                prev_id = getattr(self.act_policy, "_last_action_chunk_id", 0)
+                setattr(self.act_policy, "_last_action_chunk_id", int(prev_id) + 1)
+            except Exception:
+                pass
+        if actions_seq.ndim != 3:
+            raise ValueError(f"Expected ACT to return (B, S, D) actions, got shape {tuple(actions_seq.shape)}")
+
+        if not (0 <= self.action_index < actions_seq.shape[1]):
+            raise ValueError(
+                f"act_action_index={self.action_index} out of range for chunk_size={actions_seq.shape[1]}"
+            )
+        return actions_seq[:, self.action_index]
+
+    def _postprocess_action(self, action: Tensor) -> Tensor:
+        if self.postprocessor is None:
+            return action
+
+        # The processor pipeline expects a batch-like dict with an `action` key.
+        processed = self.postprocessor({ACTION: action})
+        if not isinstance(processed, dict) or ACTION not in processed:
+            raise TypeError("ACT postprocessor must return a dict containing an 'action' key.")
+        processed_action = processed[ACTION]
+        if not isinstance(processed_action, torch.Tensor):
+            raise TypeError(f"ACT postprocessor returned non-tensor action: {type(processed_action)}")
+        return processed_action
+
+    def _minmax_normalize_action(self, action: Tensor) -> Tensor:
+        if self._action_min is None or self._action_max is None:
+            raise ValueError(
+                "action_min/action_max are required to map ACT postprocessed actions back into SAC's [-1, 1] space."
+            )
+        action_min = self._action_min.to(device=action.device, dtype=action.dtype)
+        action_max = self._action_max.to(device=action.device, dtype=action.dtype)
+        denom = (action_max - action_min).clamp(min=1e-6)
+        return 2.0 * (action - action_min) / denom - 1.0
+
+    def prior_action(self, observations: dict[str, Tensor], *, use_action_queue: bool) -> Tensor:
+        """Compute the ACT-based prior action in SAC's normalized [-1, 1] action space."""
+        act_action: Tensor
+        if (
+            use_action_queue
+            and getattr(getattr(self.act_policy, "config", None), "temporal_ensemble_coeff", None) is None
+            and hasattr(self.act_policy, "_action_queue")
+            and len(getattr(self.act_policy, "_action_queue")) > 0
+        ):
+            # Fast path: when the ACT queue is non-empty, the next action is returned without
+            # using the current observation, so we can skip expensive preprocessing.
+            act_action = self._predict_act_action({}, use_action_queue=True)
+        else:
+            batch = self._act_batch(observations)
+            act_action = self._predict_act_action(batch, use_action_queue=use_action_queue)
+
+        # If a postprocessor exists, it typically unnormalizes ACT actions into "env action" units.
+        # Map back into SAC's normalized [-1, 1] space using the configured min/max bounds.
+        if self.postprocessor is not None:
+            act_action = self._postprocess_action(act_action)
+            act_action = self._minmax_normalize_action(act_action)
+        else:
+            # Without a postprocessor we assume ACT already outputs in SAC-normalized space (common when
+            # ACTION normalization during ACT training used MIN_MAX).
+            pass
+
+        return act_action.clamp(min=-1.0, max=1.0)
+
+    def _sample_from_prior(self, prior_action: Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if prior_action.device != self.log_std.device:
+            prior_action = prior_action.to(device=self.log_std.device)
+
+        eps = 1e-6
+        prior_action_safe = prior_action.clamp(min=-1.0 + eps, max=1.0 - eps)
+        means = torch.atanh(prior_action_safe)
+
+        std = torch.exp(self.log_std).clamp(min=1e-5)
+        std = std.expand_as(means)
+        dist = TanhMultivariateNormalDiag(loc=means, scale_diag=std)
+        actions = dist.rsample()
+        log_probs = dist.log_prob(actions)
+        return actions, log_probs
+
+    def forward(
+        self,
+        observations: dict[str, Tensor],
+        observation_features: Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        del observation_features
+
+        prior_action = self.prior_action(observations, use_action_queue=False)
+        actions, log_probs = self._sample_from_prior(prior_action)
+        return actions, log_probs, prior_action
+
+
+class SACActPolicy(SACPolicy):
+    """SAC policy that uses a pretrained ACT model as its actor (fine-tuned via SAC)."""
+
+    config_class = SACActConfig
+    name = "sac_act"
+
+    def __init__(self, config: SACActConfig | None = None):
+        super().__init__(config)
+
+    def _init_actor(self, continuous_action_dim: int):
+        cfg: SACActConfig = self.config  # type: ignore[assignment]
+        if cfg.act_pretrained_path is None:
+            raise ValueError("`policy.act_pretrained_path` is required when `policy.type` is 'sac_act'.")
+
+        # Load ACT policy on the same device as the SAC policy.
+        # Import locally to avoid heavyweight imports unless this policy type is used.
+        from lerobot.configs.policies import PreTrainedConfig as _PreTrainedConfig
+        from lerobot.policies.act.modeling_act import ACTPolicy
+        from lerobot.policies.act.configuration_act import ACTConfig
+        from lerobot.processor.pipeline import DataProcessorPipeline
+        from lerobot.processor.device_processor import DeviceProcessorStep
+
+        act_cfg = _PreTrainedConfig.from_pretrained(cfg.act_pretrained_path)
+        if act_cfg.type != "act":
+            raise ValueError(
+                f"`policy.act_pretrained_path` must point to an ACT policy, but got type={act_cfg.type!r}."
+            )
+        act_cfg.device = cfg.device
+        act_policy: ACTPolicy = ACTPolicy.from_pretrained(cfg.act_pretrained_path, config=act_cfg)
+        act_policy.to(cfg.device)
+        act_policy.eval()
+
+        act_action_norm_mode = None
+        if isinstance(act_policy.config, ACTConfig) and isinstance(act_policy.config.normalization_mapping, dict):
+            act_action_norm_mode = act_policy.config.normalization_mapping.get("ACTION")
+
+        # Optional ACT preprocessor (normalization) to match the distribution seen during ACT training.
+        preprocessor = None
+        if cfg.act_use_preprocessor:
+            preprocessor_config = f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json"
+            try:
+                preprocessor = DataProcessorPipeline.from_pretrained(
+                    cfg.act_pretrained_path, config_filename=preprocessor_config
+                )
+                # Ensure preprocessor device matches current run device (best-effort).
+                for step in getattr(preprocessor, "steps", []):
+                    if isinstance(step, DeviceProcessorStep):
+                        step.device = cfg.device
+                        step.__post_init__()
+            except Exception:
+                # If the ACT checkpoint doesn't contain a preprocessor, proceed without it.
+                preprocessor = None
+
+        # Optional ACT postprocessor (action unnormalization). Needed when ACT was trained with
+        # ACTION normalization modes like MEAN_STD. If unavailable, we fall back to treating ACT
+        # outputs as already in SAC-normalized space (common for MIN_MAX).
+        postprocessor = None
+        if getattr(cfg, "act_use_postprocessor", True):
+            postprocessor_config = f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}.json"
+            try:
+                postprocessor = DataProcessorPipeline.from_pretrained(
+                    cfg.act_pretrained_path, config_filename=postprocessor_config
+                )
+                for step in getattr(postprocessor, "steps", []):
+                    if isinstance(step, DeviceProcessorStep):
+                        step.device = cfg.device
+                        step.__post_init__()
+            except FileNotFoundError:
+                postprocessor = None
+            if postprocessor is None and act_action_norm_mode is not None and act_action_norm_mode != NormalizationMode.MIN_MAX:
+                raise FileNotFoundError(
+                    f"{postprocessor_config} not found in {cfg.act_pretrained_path}. "
+                    "This ACT checkpoint appears to use an ACTION normalization mode that requires a postprocessor "
+                    f"(got {act_action_norm_mode!r}). Point `policy.act_pretrained_path` to a full ACT model export "
+                    "that includes the policy processors, or set `policy.act_use_postprocessor=false` if you know "
+                    "the ACT outputs are already in SAC-normalized [-1, 1] space."
+                )
+
+        act_image_features = []
+        if getattr(act_policy.config, "image_features", None):
+            # ACTConfig.image_features returns list[str]
+            act_image_features = list(act_policy.config.image_features)
+
+        # Basic dimension sanity check.
+        act_action_dim = act_policy.config.action_feature.shape[0]
+        if act_action_dim != continuous_action_dim:
+            raise ValueError(
+                f"Action dim mismatch between SAC config and ACT checkpoint: "
+                f"SAC expects {continuous_action_dim}, ACT provides {act_action_dim}."
+            )
+
+        # If we apply an ACT postprocessor, we must map back to SAC's [-1, 1] space using min/max stats.
+        action_min = None
+        action_max = None
+        if postprocessor is not None:
+            action_stats = (cfg.dataset_stats or {}).get(ACTION, {})
+            if not isinstance(action_stats, dict) or "min" not in action_stats or "max" not in action_stats:
+                raise ValueError(
+                    "When using an ACT postprocessor, you must provide `policy.dataset_stats.action.min/max` "
+                    "so SAC-ACT can map ACT actions back into SAC's [-1, 1] space."
+                )
+            action_min = action_stats["min"]
+            action_max = action_stats["max"]
+
+        self.actor = _ACTGaussianActor(
+            act_policy=act_policy,
+            act_image_features=act_image_features,
+            action_dim=continuous_action_dim,
+            action_index=cfg.act_action_index,
+            init_std=cfg.act_init_std,
+            preprocessor=preprocessor,
+            postprocessor=postprocessor,
+            action_min=action_min,
+            action_max=action_max,
+            act_action_norm_mode=act_action_norm_mode,
+        )
+
+        # Keep SAC target entropy logic.
+        self.target_entropy = self.config.target_entropy
+        if self.target_entropy is None:
+            dim = continuous_action_dim + (1 if self.config.num_discrete_actions is not None else 0)
+            self.target_entropy = -np.prod(dim) / 2
+
+    @torch.no_grad()
+    def select_action(self, batch: dict[str, Tensor]) -> Tensor:
+        """Select action for inference/evaluation.
+
+        If `policy.act_deterministic_inference` is True, returns the ACT prior (distribution mode).
+        Otherwise, samples a tanh-Gaussian action centered on the ACT prior (SAC-style).
+        """
+        cfg: SACActConfig = self.config  # type: ignore[assignment]
+        prior_action = self.actor.prior_action(batch, use_action_queue=getattr(cfg, "act_use_action_queue", False))
+        if getattr(cfg, "act_deterministic_inference", False):
+            actions = prior_action
+        else:
+            actions, _ = self.actor._sample_from_prior(prior_action)
+
+        if self.config.num_discrete_actions is not None:
+            discrete_action_value = self.discrete_critic(batch, None)
+            discrete_action = torch.argmax(discrete_action_value, dim=-1, keepdim=True)
+            actions = torch.cat([actions, discrete_action], dim=-1)
+
+        return actions
+
+    def reset(self) -> None:
+        reset_fn = getattr(self.actor, "reset", None)
+        if callable(reset_fn):
+            reset_fn()

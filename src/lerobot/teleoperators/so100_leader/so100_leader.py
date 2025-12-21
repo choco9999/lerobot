@@ -15,7 +15,10 @@
 # limitations under the License.
 
 import logging
+import os
+import sys
 import time
+from queue import Queue
 
 from lerobot.motors import Motor, MotorCalibration, MotorNormMode
 from lerobot.motors.feetech import (
@@ -25,9 +28,21 @@ from lerobot.motors.feetech import (
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 
 from ..teleoperator import Teleoperator
+from ..utils import TeleopEvents
 from .config_so100_leader import SO100LeaderConfig
 
 logger = logging.getLogger(__name__)
+
+PYNPUT_AVAILABLE = True
+try:
+    if ("DISPLAY" not in os.environ) and ("linux" in sys.platform):
+        raise ImportError("pynput blocked intentionally due to no display.")
+
+    from pynput import keyboard as pynput_keyboard
+except Exception as e:  # noqa: BLE001
+    logger.info(f"pynput not available for SO100Leader events: {e}")
+    pynput_keyboard = None
+    PYNPUT_AVAILABLE = False
 
 
 class SO100Leader(Teleoperator):
@@ -54,6 +69,14 @@ class SO100Leader(Teleoperator):
             calibration=self.calibration,
         )
 
+        self._event_queue: Queue[str] = Queue()
+        self._keyboard_listener = None
+        self._intervention_active = False
+        self._pending_terminate_episode = False
+        self._pending_success = False
+        self._pending_rerecord_episode = False
+        self._last_action: dict[str, float] | None = None
+
     @property
     def action_features(self) -> dict[str, type]:
         return {f"{motor}.pos": float for motor in self.bus.motors}
@@ -78,7 +101,63 @@ class SO100Leader(Teleoperator):
             self.calibrate()
 
         self.configure()
+
+        if PYNPUT_AVAILABLE and pynput_keyboard is not None:
+            self._keyboard_listener = pynput_keyboard.Listener(on_press=self._on_key_press)
+            self._keyboard_listener.start()
+
         logger.info(f"{self} connected.")
+
+    def _on_key_press(self, key) -> None:
+        if not PYNPUT_AVAILABLE or pynput_keyboard is None:
+            return
+
+        try:
+            if key == pynput_keyboard.Key.space:
+                self._event_queue.put("space")
+            elif key == pynput_keyboard.Key.esc:
+                self._event_queue.put("esc")
+            elif hasattr(key, "char") and key.char is not None:
+                if key.char in {"s", "r", "q"}:
+                    self._event_queue.put(key.char)
+        except Exception:  # noqa: BLE001
+            return
+
+    def get_teleop_events(self) -> dict:
+        if not (PYNPUT_AVAILABLE and pynput_keyboard is not None and self._keyboard_listener is not None):
+            return {
+                TeleopEvents.IS_INTERVENTION: False,
+                TeleopEvents.TERMINATE_EPISODE: False,
+                TeleopEvents.SUCCESS: False,
+                TeleopEvents.RERECORD_EPISODE: False,
+            }
+
+        while not self._event_queue.empty():
+            key = self._event_queue.get_nowait()
+            if key == "space":
+                self._intervention_active = not self._intervention_active
+            elif key == "s":
+                self._pending_success = True
+            elif key == "r":
+                self._pending_terminate_episode = True
+                self._pending_rerecord_episode = True
+            elif key in {"q", "esc"}:
+                self._pending_terminate_episode = True
+
+        terminate_episode = self._pending_terminate_episode
+        success = self._pending_success
+        rerecord_episode = self._pending_rerecord_episode
+
+        self._pending_terminate_episode = False
+        self._pending_success = False
+        self._pending_rerecord_episode = False
+
+        return {
+            TeleopEvents.IS_INTERVENTION: self._intervention_active,
+            TeleopEvents.TERMINATE_EPISODE: terminate_episode,
+            TeleopEvents.SUCCESS: success,
+            TeleopEvents.RERECORD_EPISODE: rerecord_episode,
+        }
 
     @property
     def is_calibrated(self) -> bool:
@@ -141,8 +220,16 @@ class SO100Leader(Teleoperator):
 
     def get_action(self) -> dict[str, float]:
         start = time.perf_counter()
-        action = self.bus.sync_read("Present_Position")
-        action = {f"{motor}.pos": val for motor, val in action.items()}
+        try:
+            action_raw = self.bus.sync_read("Present_Position", num_retry=2)
+        except ConnectionError as e:
+            if self._last_action is not None:
+                logger.warning("%s failed to read action (%s); using last action.", self, e)
+                return dict(self._last_action)
+            raise
+
+        action = {f"{motor}.pos": val for motor, val in action_raw.items()}
+        self._last_action = dict(action)
         dt_ms = (time.perf_counter() - start) * 1e3
         logger.debug(f"{self} read action: {dt_ms:.1f}ms")
         return action
@@ -154,6 +241,10 @@ class SO100Leader(Teleoperator):
     def disconnect(self) -> None:
         if not self.is_connected:
             DeviceNotConnectedError(f"{self} is not connected.")
+
+        if self._keyboard_listener is not None:
+            self._keyboard_listener.stop()
+            self._keyboard_listener = None
 
         self.bus.disconnect()
         logger.info(f"{self} disconnected.")

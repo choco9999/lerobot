@@ -1,0 +1,258 @@
+{
+    "output_dir": null,
+    "job_name": "record_home_rl",
+    "resume": false,
+    "seed": 1000,
+    "num_workers": 4,
+    "batch_size": 256,
+    "steps": 200000,
+    "eval_freq": 20000,
+    "log_freq": 500,
+    "save_checkpoint": true,
+    "save_freq": 50000,
+    "wandb": {
+        "enable": false,
+        "project": "so101_record_home_rl",
+        "disable_artifact": true
+    },
+    "dataset": {
+        "repo_id": "chocolat-nya/record_home",
+        "use_imagenet_stats": false
+    },
+    "policy": {
+        "repo_id": "chocolat-nya/record_home_rl_policy",
+        "type": "sac",
+        "n_obs_steps": 1,
+        "normalization_mapping": {
+            "VISUAL": "MEAN_STD",
+            "STATE": "MIN_MAX",
+            "ENV": "MIN_MAX",
+            "ACTION": "MIN_MAX"
+        },
+        "input_features": {
+            "observation.images.front": {
+                "type": "VISUAL",
+                "shape": [
+                    3,
+                    480,
+                    640
+                ]
+            },
+            "observation.images.wrist": {
+                "type": "VISUAL",
+                "shape": [
+                    3,
+                    480,
+                    640
+                ]
+            },
+            "observation.state": {
+                "type": "STATE",
+                "shape": [
+                    6
+                ]
+            }
+        },
+        "output_features": {
+            "action": {
+                "type": "ACTION",
+                "shape": [
+                    6
+                ]
+            }
+        },
+        "device": "cuda",
+        "use_amp": false,
+        "dataset_stats": {
+            "observation.images.front": {
+                "mean": [
+                    0.5474576361655775,
+                    0.5073489023853006,
+                    0.4401476598543828
+                ],
+                "std": [
+                    0.14422543393761433,
+                    0.17115395719138546,
+                    0.204689477700336
+                ]
+            },
+            "observation.images.wrist": {
+                "mean": [
+                    0.5651548524001268,
+                    0.5369565154831308,
+                    0.47932872241859504
+                ],
+                "std": [
+                    0.19808793203468503,
+                    0.21469665231947563,
+                    0.20837381366736107
+                ]
+            },
+            "observation.state": {
+                "min": [
+                    -35.88441848754883,
+                    -100.0,
+                    -90.9909896850586,
+                    -99.68241119384766,
+                    -92.35127258300781,
+                    1.028938889503479
+                ],
+                "max": [
+                    16.673173904418945,
+                    36.97552490234375,
+                    100.0,
+                    -35.053592681884766,
+                    74.0321044921875,
+                    70.35369873046875
+                ]
+            },
+            "action": {
+                "min": [
+                    -36.26204299926758,
+                    -100.0,
+                    -93.20036315917969,
+                    -100.0,
+                    -92.6229476928711,
+                    0.0
+                ],
+                "max": [
+                    17.225433349609375,
+                    36.2931022644043,
+                    99.00271606445312,
+                    -34.52622985839844,
+                    74.49909210205078,
+                    70.76167297363281
+                ]
+            }
+        },
+        "num_discrete_actions": 3,
+        "storage_device": "cuda",
+        "vision_encoder_name": "helper2424/resnet10",
+        "freeze_vision_encoder": true,
+        "image_encoder_hidden_dim": 32,
+        "shared_encoder": true,
+        "online_steps": 300000,
+        "online_buffer_capacity": 30000,
+        "offline_buffer_capacity": 10000,
+        "online_step_before_learning": 100,
+        "policy_update_freq": 1,
+        "discount": 0.97,
+        "async_prefetch": false,
+        "temperature_init": 0.01,
+        "num_critics": 2,
+        "num_subsample_critics": null,
+        "critic_lr": 0.0003,
+        "actor_lr": 0.0003,
+        "temperature_lr": 0.0003,
+        "critic_target_update_weight": 0.005,
+        "utd_ratio": 2,
+        "state_encoder_hidden_dim": 256,
+        "latent_dim": 256,
+        "target_entropy": null,
+        "use_backup_entropy": true,
+        "grad_clip_norm": 40.0,
+        "critic_network_kwargs": {
+            "hidden_dims": [
+                256,
+                256
+            ],
+            "activate_final": true,
+            "final_activation": null
+        },
+        "actor_network_kwargs": {
+            "hidden_dims": [
+                256,
+                256
+            ],
+            "activate_final": true
+        },
+        "policy_kwargs": {
+            "use_tanh_squash": true,
+            "init_final": 0.05
+        },
+        "actor_learner_config": {
+            "learner_host": "127.0.0.1",
+            "learner_port": 50051,
+            "policy_parameters_push_frequency": 4,
+            "queue_get_timeout": 0.1
+        },
+        "concurrency": {
+            "actor": "threads",
+            "learner": "threads"
+        }
+    },
+    "env": {
+        "type": "gym_manipulator",
+        "name": "real_robot",
+        "fps": 30,
+        "processor": {
+            "control_mode": "leader",
+            "observation": {
+                "display_cameras": false,
+                "add_joint_velocity_to_observation": true,
+                "add_current_to_observation": false
+            },
+            "image_preprocessing": {
+                "crop_params_dict": {
+                    "observation.images.front": [
+                        0,
+                        0,
+                        480,
+                        640
+                    ],
+                    "observation.images.wrist": [
+                        0,
+                        0,
+                        480,
+                        640
+                    ]
+                },
+                "resize_size": [
+                    128,
+                    128
+                ]
+            },
+            "gripper": {
+                "use_gripper": true,
+                "gripper_penalty": -0.02
+            },
+            "reset": {
+                "fixed_reset_joint_positions": [
+                    0.0,
+                    0.195,
+                    0.0,
+                    -2.43,
+                    0.0,
+                    2.62,
+                    0.785
+                ],
+                "reset_time_s": 5.0,
+                "control_time_s": 15.0
+            }
+        },
+        "robot": {
+            "type": "so101_follower",
+            "port": "/dev/ttyACM0",
+            "cameras": {
+                "front": {
+                    "type": "opencv",
+                    "index_or_path": 4,
+                    "height": 480,
+                    "width": 640,
+                    "fps": 15
+                },
+                "wrist": {
+                    "type": "opencv",
+                    "index_or_path": 2,
+                    "height": 480,
+                    "width": 640,
+                    "fps": 15
+                }
+            }
+        },
+        "teleop": {
+            "type": "so101_leader",
+            "port": "/dev/ttyACM1"
+        }
+    }
+}

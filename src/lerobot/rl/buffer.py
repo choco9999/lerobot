@@ -87,6 +87,7 @@ class ReplayBuffer:
         use_drq: bool = True,
         storage_device: str = "cpu",
         optimize_memory: bool = False,
+        store_images_as_uint8: bool = True,
     ):
         """
         Replay buffer for storing transitions.
@@ -104,6 +105,9 @@ class ReplayBuffer:
                 Using "cpu" can help save GPU memory.
             optimize_memory (bool): If True, optimizes memory by not storing duplicate next_states when
                 they can be derived from states. This is useful for large datasets where next_state[i] = state[i+1].
+            store_images_as_uint8 (bool): If True, stores visual observations as uint8 on the storage device and
+                converts them to float32/[0,1] when sampling. This drastically reduces RAM usage for high-resolution
+                camera observations.
         """
         if capacity <= 0:
             raise ValueError("Capacity must be greater than 0.")
@@ -115,6 +119,7 @@ class ReplayBuffer:
         self.size = 0
         self.initialized = False
         self.optimize_memory = optimize_memory
+        self.store_images_as_uint8 = store_images_as_uint8
 
         # Track episode boundaries for memory optimization
         self.episode_ends = torch.zeros(capacity, dtype=torch.bool, device=storage_device)
@@ -142,16 +147,34 @@ class ReplayBuffer:
 
         # Pre-allocate tensors for storage
         self.states = {
-            key: torch.empty((self.capacity, *shape), device=self.storage_device)
+            key: torch.empty(
+                (self.capacity, *shape),
+                device=self.storage_device,
+                dtype=(
+                    torch.uint8
+                    if self.store_images_as_uint8 and key.startswith(OBS_IMAGE)
+                    else state[key].dtype
+                ),
+            )
             for key, shape in state_shapes.items()
         }
-        self.actions = torch.empty((self.capacity, *action_shape), device=self.storage_device)
-        self.rewards = torch.empty((self.capacity,), device=self.storage_device)
+        self.actions = torch.empty(
+            (self.capacity, *action_shape), device=self.storage_device, dtype=action.dtype
+        )
+        self.rewards = torch.empty((self.capacity,), device=self.storage_device, dtype=torch.float32)
 
         if not self.optimize_memory:
             # Standard approach: store states and next_states separately
             self.next_states = {
-                key: torch.empty((self.capacity, *shape), device=self.storage_device)
+                key: torch.empty(
+                    (self.capacity, *shape),
+                    device=self.storage_device,
+                    dtype=(
+                        torch.uint8
+                        if self.store_images_as_uint8 and key.startswith(OBS_IMAGE)
+                        else state[key].dtype
+                    ),
+                )
                 for key, shape in state_shapes.items()
             }
         else:
@@ -176,7 +199,7 @@ class ReplayBuffer:
                     self.complementary_info[key] = torch.empty(
                         (self.capacity, *value_shape), device=self.storage_device
                     )
-                elif isinstance(value, (int | float)):
+                elif isinstance(value, (int, float)):
                     # Handle scalar values similar to reward
                     self.complementary_info[key] = torch.empty((self.capacity,), device=self.storage_device)
                 else:
@@ -204,16 +227,25 @@ class ReplayBuffer:
 
         # Store the transition in pre-allocated tensors
         for key in self.states:
-            self.states[key][self.position].copy_(state[key].squeeze(dim=0))
+            src_state = state[key].squeeze(dim=0)
+            if self.store_images_as_uint8 and key.startswith(OBS_IMAGE):
+                if src_state.dtype != torch.uint8:
+                    src_state = (src_state * 255.0).round().clamp(0, 255).to(torch.uint8)
+            self.states[key][self.position].copy_(src_state.to(self.storage_device))
 
             if not self.optimize_memory:
                 # Only store next_states if not optimizing memory
-                self.next_states[key][self.position].copy_(next_state[key].squeeze(dim=0))
+                src_next_state = next_state[key].squeeze(dim=0)
+                if self.store_images_as_uint8 and key.startswith(OBS_IMAGE):
+                    if src_next_state.dtype != torch.uint8:
+                        src_next_state = (src_next_state * 255.0).round().clamp(0, 255).to(torch.uint8)
+                self.next_states[key][self.position].copy_(src_next_state.to(self.storage_device))
 
-        self.actions[self.position].copy_(action.squeeze(dim=0))
+        self.actions[self.position].copy_(action.squeeze(dim=0).to(self.storage_device))
         self.rewards[self.position] = reward
         self.dones[self.position] = done
         self.truncateds[self.position] = truncated
+        self.episode_ends[self.position] = bool(done) or bool(truncated)
 
         # Handle complementary_info if provided and storage is initialized
         if complementary_info is not None and self.has_complementary_info:
@@ -223,7 +255,7 @@ class ReplayBuffer:
                     value = complementary_info[key]
                     if isinstance(value, torch.Tensor):
                         self.complementary_info[key][self.position].copy_(value.squeeze(dim=0))
-                    elif isinstance(value, (int | float)):
+                    elif isinstance(value, (int, float)):
                         self.complementary_info[key][self.position] = value
 
         self.position = (self.position + 1) % self.capacity
@@ -235,10 +267,30 @@ class ReplayBuffer:
             raise RuntimeError("Cannot sample from an empty buffer. Add transitions first.")
 
         batch_size = min(batch_size, self.size)
-        high = max(0, self.size - 1) if self.optimize_memory and self.size < self.capacity else self.size
+        if self.optimize_memory:
+            if self.size < 2:
+                raise RuntimeError("Cannot sample with optimize_memory=True before at least 2 transitions exist.")
 
-        # Random indices for sampling - create on the same device as storage
-        idx = torch.randint(low=0, high=high, size=(batch_size,), device=self.storage_device)
+            if self.size < self.capacity:
+                # When not full, we can't sample the most recent transition because next_state is undefined.
+                high = max(1, self.size - 1)
+                idx = torch.randint(low=0, high=high, size=(batch_size,), device=self.storage_device)
+            else:
+                # When full, exclude the most recent transition (position-1) to keep next_state well-defined.
+                last_inserted = (self.position - 1) % self.capacity
+                idx = torch.randint(low=0, high=self.capacity, size=(batch_size,), device=self.storage_device)
+                # Resample any occurrences of last_inserted (rare but important).
+                mask = idx == last_inserted
+                while mask.any():
+                    idx[mask] = torch.randint(
+                        low=0,
+                        high=self.capacity,
+                        size=(int(mask.sum().item()),),
+                        device=self.storage_device,
+                    )
+                    mask = idx == last_inserted
+        else:
+            idx = torch.randint(low=0, high=self.size, size=(batch_size,), device=self.storage_device)
 
         # Identify image keys that need augmentation
         image_keys = [k for k in self.states if k.startswith(OBS_IMAGE)] if self.use_drq else []
@@ -249,15 +301,29 @@ class ReplayBuffer:
 
         # First pass: load all state tensors to target device
         for key in self.states:
-            batch_state[key] = self.states[key][idx].to(self.device)
+            state_val = self.states[key][idx]
+            if self.store_images_as_uint8 and key.startswith(OBS_IMAGE):
+                batch_state[key] = state_val.to(self.device).float() / 255.0
+            else:
+                batch_state[key] = state_val.to(self.device)
 
             if not self.optimize_memory:
                 # Standard approach - load next_states directly
-                batch_next_state[key] = self.next_states[key][idx].to(self.device)
+                next_val = self.next_states[key][idx]
+                if self.store_images_as_uint8 and key.startswith(OBS_IMAGE):
+                    batch_next_state[key] = next_val.to(self.device).float() / 255.0
+                else:
+                    batch_next_state[key] = next_val.to(self.device)
             else:
                 # Memory-optimized approach - get next_state from the next index
                 next_idx = (idx + 1) % self.capacity
-                batch_next_state[key] = self.states[key][next_idx].to(self.device)
+                done_mask = self.episode_ends[idx]
+                next_idx = torch.where(done_mask, idx, next_idx)
+                next_val = self.states[key][next_idx]
+                if self.store_images_as_uint8 and key.startswith(OBS_IMAGE):
+                    batch_next_state[key] = next_val.to(self.device).float() / 255.0
+                else:
+                    batch_next_state[key] = next_val.to(self.device)
 
         # Apply image augmentation in a batched way if needed
         if self.use_drq and image_keys:

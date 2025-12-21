@@ -1,0 +1,93 @@
+[前準備]
+cd lerobot
+source venv/bin/activate
+sudo chmod 777 -R /dev
+
+conda activate lerobot
+
+[動かすだけ]
+sudo rm -R /home/tmc/.cache/huggingface/lerobot/chocolat-nya/eval_record_tag_test
+
+python -m src.lerobot.scripts.lerobot_teleoperate \
+    --robot.type=so101_follower \
+    --robot.port=/dev/ttyACM0 \
+    --robot.id=my_awesome_follower_arm \
+    --teleop.type=so101_leader \
+    --teleop.port=/dev/ttyACM1 \
+    --teleop.id=my_awesome_leader_arm
+
+
+[動作を止める]
+ctrl+c
+
+
+[キャリブレーション]
+python -m src.lerobot.scripts.lerobot_calibrate \
+    --robot.type=so101_follower \
+    --robot.port=/dev/ttyACM0 \
+    --robot.id=my_awesome_follower_arm
+
+python -m src.lerobot.scripts.lerobot_calibrate \
+    --teleop.type=so101_leader \
+    --teleop.port=/dev/ttyACM1 \
+    --teleop.id=my_awesome_leader_arm
+
+
+[学習]
+sudo rm -R /home/kazu/.cache/huggingface/lerobot/chocolat-nya/record_test100_tahara_c2
+
+python -m src.lerobot.scripts.lerobot_record \
+  --robot.discover_packages_path=lerobot.robots.so101_follower \
+  --robot.cameras.discover_packages_path=lerobot.cameras.opencv \
+  --robot.type=so101_follower \
+  --robot.port=/dev/ttyACM0 \
+  --robot.id=my_awesome_follower_arm \
+  --robot.cameras='{"front": {"type": "opencv", "index_or_path": 2, "width": 640, "height": 480, "fps": 30}, "back": {"type": "opencv", "index_or_path": 4, "width": 640, "height": 480, "fps": 15}}' \
+  --teleop.discover_packages_path=lerobot.teleoperators.so101_leader \
+  --teleop.type=so101_leader \
+  --teleop.port=/dev/ttyACM1 \
+  --teleop.id=my_awesome_leader_arm \
+  --dataset.repo_id=chocolat-nya/record_test100_tahara_c2 \
+  --dataset.single_task="Grab the black cube" \
+  --dataset.episode_time_s=15 \
+  --dataset.reset_time_s=5 \
+  --dataset.num_episodes=10 \
+  --display_data=false \
+  --resume=true
+
+
+
+
+[推論]
+sudo rm -R /home/kazu/.cache/huggingface/lerobot/chocolat-nya/eval_record_test100_tahara_c
+
+python -m src.lerobot.scripts.lerobot_record  \
+    --robot.type=so101_follower \
+    --robot.port=/dev/ttyACM1 \
+    --robot.id=my_awesome_follower_arm \
+    --robot.cameras="{ front: {type: opencv, index_or_path: 2, width: 640, height: 480, fps: 30}, back: {type: opencv, index_or_path: 4, width: 640, height: 480, fps: 30}}" \
+    --display_data=false \
+    --dataset.repo_id=chocolat-nya/eval_record_test100_tahara_c \
+    --dataset.single_task="Grab the black cube" \
+    --policy.device=mps \
+    --policy.path=chocolat-nya/record_test100_tahara_c
+
+
+[強化学習(HIL-SERL)]
+# 事前に依存関係を入れる（未導入の場合）
+#   pip install -e ".[hilserl]"
+#
+# 1) 設定を編集（ポート/カメラ/関節数/ action の min/max）
+#   src/lerobot/configs/train_config_hilserl_so101.json
+#
+# 2) learner を起動（別ターミナル）
+#   python -m src.lerobot.rl.learner --config_path src/lerobot/configs/train_config_hilserl_so101_act.json
+#
+# 3) actor を起動（別ターミナル）
+#   python -m src.lerobot.rl.actor --config_path src/lerobot/configs/train_config_hilserl_so101_act.json
+#
+# 介入・ラベル操作（SO101 leader 使用時）
+#   space : 介入ON/OFF（トグル）
+#   s     : 成功（success）
+#   q/esc : 失敗（terminate）
+#   r     : rerecord（terminate + rerecord）

@@ -25,7 +25,7 @@ Examples of usage:
 
 - Start a learner server for training:
 ```bash
-python -m lerobot.rl.learner --config_path src/lerobot/configs/train_config_hilserl_so100.json
+python -m lerobot.rl.learner --config_path src/lerobot/configs/train_config_hilserl_so101.json
 ```
 
 **NOTE**: Start the learner server before launching the actor server. The learner opens a gRPC server
@@ -69,7 +69,7 @@ from lerobot.policies.sac.modeling_sac import SACPolicy
 from lerobot.rl.buffer import ReplayBuffer, concatenate_batch_transitions
 from lerobot.rl.process import ProcessSignalHandler
 from lerobot.rl.wandb_utils import WandBLogger
-from lerobot.robots import so100_follower  # noqa: F401
+from lerobot.robots import so100_follower, so101_follower  # noqa: F401
 from lerobot.teleoperators import gamepad, so101_leader  # noqa: F401
 from lerobot.teleoperators.utils import TeleopEvents
 from lerobot.transport import services_pb2_grpc
@@ -190,10 +190,17 @@ def start_learner_threads(
         wandb_logger (WandBLogger | None): Logger for metrics
         shutdown_event: Event to signal shutdown
     """
-    # Create multiprocessing queues
-    transition_queue = Queue()
-    interaction_message_queue = Queue()
-    parameters_queue = Queue()
+    # Use thread queues when running fully threaded to avoid OS-level semaphores.
+    if use_threads(cfg):
+        import queue as _queue
+
+        transition_queue = _queue.Queue()
+        interaction_message_queue = _queue.Queue()
+        parameters_queue = _queue.Queue()
+    else:
+        transition_queue = Queue()
+        interaction_message_queue = Queue()
+        parameters_queue = Queue()
 
     concurrency_entity = None
 
@@ -230,17 +237,19 @@ def start_learner_threads(
     logging.info("[LEARNER] Training process stopped")
 
     logging.info("[LEARNER] Closing queues")
-    transition_queue.close()
-    interaction_message_queue.close()
-    parameters_queue.close()
+    if not use_threads(cfg):
+        transition_queue.close()
+        interaction_message_queue.close()
+        parameters_queue.close()
 
     communication_process.join()
     logging.info("[LEARNER] Communication process joined")
 
     logging.info("[LEARNER] join queues")
-    transition_queue.cancel_join_thread()
-    interaction_message_queue.cancel_join_thread()
-    parameters_queue.cancel_join_thread()
+    if not use_threads(cfg):
+        transition_queue.cancel_join_thread()
+        interaction_message_queue.cancel_join_thread()
+        parameters_queue.cancel_join_thread()
 
     logging.info("[LEARNER] queues closed")
 
@@ -865,11 +874,19 @@ def handle_resume_logic(cfg: TrainRLServerPipelineConfig) -> TrainRLServerPipeli
     )
 
     # Load config using Draccus
-    checkpoint_cfg_path = os.path.join(checkpoint_dir, PRETRAINED_MODEL_DIR, "train_config.json")
+    checkpoint_cfg_path = Path(checkpoint_dir) / PRETRAINED_MODEL_DIR / "train_config.json"
     checkpoint_cfg = TrainRLServerPipelineConfig.from_pretrained(checkpoint_cfg_path)
 
-    # Ensure resume flag is set in returned config
+    # Ensure resume flag is set in returned config.
     checkpoint_cfg.resume = True
+
+    # Keep the output dir used for resume detection (important if the checkpoint config stored a relative path).
+    checkpoint_cfg.output_dir = Path(out_dir)
+
+    # Ensure the policy is initialized from the latest checkpoint weights.
+    # `make_policy(...)` loads weights only when `policy.pretrained_path` is set.
+    if checkpoint_cfg.policy is not None:
+        checkpoint_cfg.policy.pretrained_path = checkpoint_cfg_path.parent
     return checkpoint_cfg
 
 
@@ -1070,7 +1087,7 @@ def check_nan_in_transition(
 
     # Check observations
     for key, tensor in observations.items():
-        if torch.isnan(tensor).any():
+        if tensor.is_floating_point() and torch.isnan(tensor).any():
             logging.error(f"observations[{key}] contains NaN values")
             nan_detected = True
             if raise_error:
@@ -1078,14 +1095,14 @@ def check_nan_in_transition(
 
     # Check next state
     for key, tensor in next_state.items():
-        if torch.isnan(tensor).any():
+        if tensor.is_floating_point() and torch.isnan(tensor).any():
             logging.error(f"next_state[{key}] contains NaN values")
             nan_detected = True
             if raise_error:
                 raise ValueError(f"NaN detected in next_state[{key}]")
 
     # Check actions
-    if torch.isnan(actions).any():
+    if actions.is_floating_point() and torch.isnan(actions).any():
         logging.error("actions contains NaN values")
         nan_detected = True
         if raise_error:
@@ -1149,7 +1166,11 @@ def process_transitions(
         transition_list = bytes_to_transitions(buffer=transition_list)
 
         for transition in transition_list:
-            transition = move_transition_to_device(transition=transition, device=device)
+            # Store transitions on the replay buffer storage device (typically CPU) to avoid GPU OOM and
+            # unnecessary device transfers. Sampling will move batches to the training device.
+            transition = move_transition_to_device(
+                transition=transition, device=getattr(replay_buffer, "storage_device", device)
+            )
 
             # Skip transitions with NaN values
             if check_nan_in_transition(
@@ -1163,9 +1184,12 @@ def process_transitions(
             replay_buffer.add(**transition)
 
             # Add to offline buffer if it's an intervention
-            if dataset_repo_id is not None and transition.get("complementary_info", {}).get(
-                TeleopEvents.IS_INTERVENTION
-            ):
+            complementary_info = transition.get("complementary_info") or {}
+            is_intervention = complementary_info.get(TeleopEvents.IS_INTERVENTION)
+            if is_intervention is None:
+                is_intervention = complementary_info.get(TeleopEvents.IS_INTERVENTION.value)
+
+            if dataset_repo_id is not None and is_intervention:
                 offline_replay_buffer.add(**transition)
 
 

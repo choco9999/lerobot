@@ -1,0 +1,203 @@
+{
+    "output_dir": null,
+    "job_name": "hilserl_so101_act",
+    "resume": false,
+    "seed": 1000,
+    "num_workers": 2,
+    "batch_size": 256,
+    "steps": 100000,
+    "eval_freq": 20000,
+    "log_freq": 500,
+    "save_checkpoint": true,
+    "save_freq": 5000,
+    "wandb": {
+        "enable": false,
+        "project": "so101_hilserl",
+        "disable_artifact": true
+    },
+    "dataset": null,
+    "policy": {
+        "type": "sac_act",
+        "act_pretrained_path": "/home/kazu/.cache/huggingface/hub/models--chocolat-nya--record_test100_tahara_c/snapshots/2374e1ce1554288ae163dbe4bffb54d707a4af8d",
+        "act_use_preprocessor": true,
+        "act_use_postprocessor": true,
+        "act_deterministic_inference": true,
+        "act_use_action_queue": true,
+        "act_log_action_chunk": true,
+        "act_action_index": 0,
+        "act_init_std": 0.2,
+        "push_to_hub": false,
+        "n_obs_steps": 1,
+        "normalization_mapping": {
+            "VISUAL": "MEAN_STD",
+            "STATE": "MIN_MAX",
+            "ENV": "MIN_MAX",
+            "ACTION": "MIN_MAX"
+        },
+        "input_features": {
+            "observation.images.front": {
+                "type": "VISUAL",
+                "shape": [
+                    3,
+                    480,
+                    640
+                ]
+            },
+            "observation.images.back": {
+                "type": "VISUAL",
+                "shape": [
+                    3,
+                    480,
+                    640
+                ]
+            },
+            "observation.state": {
+                "type": "STATE",
+                "shape": [
+                    6
+                ]
+            }
+        },
+        "output_features": {
+            "action": {
+                "type": "ACTION",
+                "shape": [
+                    6
+                ]
+            }
+        },
+        "device": "cuda",
+        "storage_device": "cpu",
+        "use_amp": false,
+        "dataset_stats": {
+            "action": {
+                "min": [
+                    -100.0,
+                    -100.0,
+                    -100.0,
+                    -100.0,
+                    -100.0,
+                    0.0
+                ],
+                "max": [
+                    100.0,
+                    100.0,
+                    100.0,
+                    100.0,
+                    100.0,
+                    100.0
+                ]
+            }
+        },
+        "vision_encoder_name": null,
+        "freeze_vision_encoder": true,
+        "image_encoder_hidden_dim": 32,
+        "shared_encoder": false,
+        "image_embedding_pooling_dim": 8,
+        "online_steps": 300000,
+        "online_buffer_capacity": 5000,
+        "offline_buffer_capacity": 5000,
+        "online_step_before_learning": 1000,
+        "policy_update_freq": 1,
+        "discount": 0.99,
+        "async_prefetch": false,
+        "temperature_init": 0.01,
+        "num_critics": 2,
+        "num_subsample_critics": null,
+        "critic_lr": 0.0003,
+        "actor_lr": 0.0003,
+        "temperature_lr": 0.0003,
+        "critic_target_update_weight": 0.005,
+        "utd_ratio": 1,
+        "state_encoder_hidden_dim": 256,
+        "latent_dim": 256,
+        "target_entropy": null,
+        "use_backup_entropy": true,
+        "grad_clip_norm": 40.0,
+        "critic_network_kwargs": {
+            "hidden_dims": [
+                256,
+                256
+            ],
+            "activate_final": true,
+            "final_activation": null
+        },
+        "actor_network_kwargs": {
+            "hidden_dims": [
+                256,
+                256
+            ],
+            "activate_final": true
+        },
+        "policy_kwargs": {
+            "use_tanh_squash": true,
+            "init_final": 0.05
+        },
+        "actor_learner_config": {
+            "learner_host": "127.0.0.1",
+            "learner_port": 50051,
+            "policy_parameters_push_frequency": 4,
+            "queue_get_timeout": 0.1
+        },
+        "concurrency": {
+            "actor": "threads",
+            "learner": "threads"
+        },
+        "use_torch_compile": false
+    },
+    "env": {
+        "type": "gym_manipulator",
+        "name": "real_robot",
+        "fps": 30,
+        "processor": {
+            "control_mode": "leader",
+            "observation": {
+                "display_cameras": false,
+                "add_joint_velocity_to_observation": false,
+                "add_current_to_observation": false
+            },
+            "image_preprocessing": {
+                "crop_params_dict": null,
+                "resize_size": null
+            },
+            "gripper": {
+                "use_gripper": true,
+                "gripper_penalty": 0.0
+            },
+            "reset": {
+                "fixed_reset_joint_positions": null,
+                "reset_time_s": 0.0,
+                "control_time_s": 15.0,
+                "terminate_on_success": true,
+                "prompt_success_failure": true
+            }
+        },
+        "robot": {
+            "type": "so101_follower",
+            "port": "/dev/ttyACM1",
+            "id": "my_awesome_follower_arm",
+            "max_relative_target": 10.0,
+            "cameras": {
+                "front": {
+                    "type": "opencv",
+                    "index_or_path": 2,
+                    "height": 480,
+                    "width": 640,
+                    "fps": 30
+                },
+                "back": {
+                    "type": "opencv",
+                    "index_or_path": 4,
+                    "height": 480,
+                    "width": 640,
+                    "fps": 10
+                }
+            }
+        },
+        "teleop": {
+            "type": "so101_leader",
+            "port": "/dev/ttyACM0",
+            "id": "my_awesome_leader_arm"
+        }
+    }
+}

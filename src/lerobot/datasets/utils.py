@@ -220,13 +220,13 @@ def serialize_dict(stats: dict[str, torch.Tensor | np.ndarray | dict]) -> dict:
     """
     serialized_dict = {}
     for key, value in flatten_dict(stats).items():
-        if isinstance(value, (torch.Tensor | np.ndarray)):
+        if isinstance(value, (torch.Tensor, np.ndarray)):
             serialized_dict[key] = value.tolist()
-        elif isinstance(value, list) and isinstance(value[0], (int | float | list)):
+        elif isinstance(value, list) and value and isinstance(value[0], (int, float, list)):
             serialized_dict[key] = value
         elif isinstance(value, np.generic):
             serialized_dict[key] = value.item()
-        elif isinstance(value, (int | float)):
+        elif isinstance(value, (int, float)):
             serialized_dict[key] = value
         else:
             raise NotImplementedError(f"The value '{value}' of type '{type(value)}' is not supported.")
@@ -1192,7 +1192,7 @@ def item_to_torch(item: dict) -> dict:
         dict: Dictionary with all tensor-like items converted to torch.Tensor.
     """
     for key, val in item.items():
-        if isinstance(val, (np.ndarray | list)) and key not in ["task"]:
+        if isinstance(val, (np.ndarray, list)) and key not in ["task"]:
             # Convert numpy arrays and lists to torch tensors
             item[key] = torch.tensor(val)
     return item

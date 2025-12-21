@@ -15,6 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import math
 import time
 from dataclasses import dataclass
@@ -41,6 +42,27 @@ from .pipeline import (
 GRIPPER_KEY = "gripper"
 DISCRETE_PENALTY_KEY = "discrete_penalty"
 TELEOP_ACTION_KEY = "teleop_action"
+
+_MINMAX_EPS = 1e-8
+logger = logging.getLogger(__name__)
+
+
+def _squeeze_batch_dim_if_present(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.ndim > 1 and tensor.shape[0] == 1:
+        return tensor.squeeze(0)
+    return tensor
+
+
+def _minmax_normalize(x: torch.Tensor, min_val: torch.Tensor, max_val: torch.Tensor) -> torch.Tensor:
+    denom = max_val - min_val
+    denom = torch.where(denom == 0, torch.full_like(denom, _MINMAX_EPS), denom)
+    return 2 * (x - min_val) / denom - 1
+
+
+def _minmax_unnormalize(x: torch.Tensor, min_val: torch.Tensor, max_val: torch.Tensor) -> torch.Tensor:
+    denom = max_val - min_val
+    denom = torch.where(denom == 0, torch.full_like(denom, _MINMAX_EPS), denom)
+    return (x + 1) / 2 * denom + min_val
 
 
 @runtime_checkable
@@ -117,7 +139,31 @@ class AddTeleopActionAsComplimentaryDataStep(ComplementaryDataProcessorStep):
             `teleop_action` key.
         """
         new_complementary_data = dict(complementary_data)
-        new_complementary_data[TELEOP_ACTION_KEY] = self.teleop_device.get_action()
+        info = {}
+        if hasattr(self, "_current_transition"):
+            maybe_info = self._current_transition.get(TransitionKey.INFO, {})
+            if isinstance(maybe_info, dict):
+                info = maybe_info
+
+        has_intervention_flag = (
+            TeleopEvents.IS_INTERVENTION in info or TeleopEvents.IS_INTERVENTION.value in info
+        )
+        is_intervention = True
+        if has_intervention_flag:
+            is_intervention = bool(
+                info.get(TeleopEvents.IS_INTERVENTION, False)
+                or info.get(TeleopEvents.IS_INTERVENTION.value, False)
+            )
+
+        if not is_intervention:
+            new_complementary_data[TELEOP_ACTION_KEY] = None
+            return new_complementary_data
+
+        try:
+            new_complementary_data[TELEOP_ACTION_KEY] = self.teleop_device.get_action()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Failed to read teleop action (%s); using policy action.", e)
+            new_complementary_data[TELEOP_ACTION_KEY] = None
         return new_complementary_data
 
     def transform_features(
@@ -408,6 +454,9 @@ class InterventionActionProcessorStep(ProcessorStep):
 
     use_gripper: bool = False
     terminate_on_success: bool = True
+    action_min: list[float] | None = None
+    action_max: list[float] | None = None
+    normalize_teleop_action: bool = False
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         """
@@ -437,21 +486,57 @@ class InterventionActionProcessorStep(ProcessorStep):
 
         # Override action if intervention is active
         if is_intervention and teleop_action is not None:
-            if isinstance(teleop_action, dict):
-                # Convert teleop_action dict to tensor format
-                action_list = [
-                    teleop_action.get("delta_x", 0.0),
-                    teleop_action.get("delta_y", 0.0),
-                    teleop_action.get("delta_z", 0.0),
-                ]
-                if self.use_gripper:
-                    action_list.append(teleop_action.get(GRIPPER_KEY, 1.0))
+            teleop_action_tensor: torch.Tensor
+            if isinstance(teleop_action, torch.Tensor):
+                teleop_action_tensor = teleop_action.to(device=action.device, dtype=action.dtype)
             elif isinstance(teleop_action, np.ndarray):
-                action_list = teleop_action.tolist()
-            else:
-                action_list = teleop_action
+                teleop_action_tensor = torch.from_numpy(teleop_action).to(
+                    device=action.device, dtype=action.dtype
+                )
+            elif isinstance(teleop_action, dict):
+                if {"delta_x", "delta_y", "delta_z"}.issubset(teleop_action):
+                    # End-effector delta control.
+                    action_list = [
+                        teleop_action.get("delta_x", 0.0),
+                        teleop_action.get("delta_y", 0.0),
+                        teleop_action.get("delta_z", 0.0),
+                    ]
+                    if self.use_gripper:
+                        action_list.append(teleop_action.get(GRIPPER_KEY, 1.0))
+                else:
+                    # Joint-space control: expect keys like "{joint}.pos".
+                    obs = transition.get(TransitionKey.OBSERVATION, {})
+                    obs_keys = []
+                    if isinstance(obs, dict):
+                        obs_keys = [
+                            k
+                            for k in obs
+                            if isinstance(k, str) and k.endswith(".pos") and k in teleop_action
+                        ]
 
-            teleop_action_tensor = torch.tensor(action_list, dtype=action.dtype, device=action.device)
+                    joint_keys = obs_keys if obs_keys else sorted(
+                        [k for k in teleop_action if isinstance(k, str) and k.endswith(".pos")]
+                    )
+                    action_list = [teleop_action[k] for k in joint_keys]
+
+                teleop_action_tensor = torch.tensor(action_list, dtype=action.dtype, device=action.device)
+            else:
+                teleop_action_tensor = torch.tensor(teleop_action, dtype=action.dtype, device=action.device)
+
+            teleop_action_tensor = _squeeze_batch_dim_if_present(teleop_action_tensor)
+
+            if self.normalize_teleop_action and self.action_min is not None and self.action_max is not None:
+                action_min = torch.tensor(self.action_min, dtype=action.dtype, device=action.device)
+                action_max = torch.tensor(self.action_max, dtype=action.dtype, device=action.device)
+                if teleop_action_tensor.numel() != action_min.numel():
+                    raise ValueError(
+                        f"Teleop action dim mismatch: got {teleop_action_tensor.numel()} values, "
+                        f"but action_min/action_max have {action_min.numel()} values."
+                    )
+                teleop_action_tensor = _minmax_normalize(teleop_action_tensor, action_min, action_max).clamp(
+                    -1.0, 1.0
+                )
+
             new_transition[TransitionKey.ACTION] = teleop_action_tensor
 
         # Handle episode termination
@@ -589,6 +674,74 @@ class RewardClassifierProcessorStep(ProcessorStep):
             "success_reward": self.success_reward,
             "terminate_on_success": self.terminate_on_success,
         }
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        return features
+
+
+@dataclass
+@ProcessorStepRegistry.register("finalize_hil_action_processor")
+class FinalizeHILActionProcessorStep(ProcessorStep):
+    """
+    Finalize the action field for env stepping and training.
+
+    - Squeezes a singleton batch dimension from the action if present.
+    - Sets `complementary_data['teleop_action']` to the (possibly overridden) action tensor.
+    """
+
+    def __call__(self, transition: EnvTransition) -> EnvTransition:
+        self._current_transition = transition.copy()
+        new_transition = self._current_transition
+
+        action = new_transition.get(TransitionKey.ACTION)
+        if isinstance(action, torch.Tensor):
+            action = _squeeze_batch_dim_if_present(action)
+            new_transition[TransitionKey.ACTION] = action
+
+        complementary_data = new_transition.get(TransitionKey.COMPLEMENTARY_DATA) or {}
+        complementary_data[TELEOP_ACTION_KEY] = action
+        new_transition[TransitionKey.COMPLEMENTARY_DATA] = complementary_data
+
+        return new_transition
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        return features
+
+
+@dataclass
+@ProcessorStepRegistry.register("minmax_unnormalize_action_processor")
+class MinMaxUnnormalizeActionProcessorStep(ProcessorStep):
+    """Unnormalize a policy action from [-1, 1] to [min, max] using per-dimension bounds."""
+
+    action_min: list[float] | None = None
+    action_max: list[float] | None = None
+
+    def __call__(self, transition: EnvTransition) -> EnvTransition:
+        self._current_transition = transition.copy()
+        new_transition = self._current_transition
+
+        if self.action_min is None or self.action_max is None:
+            return new_transition
+
+        action = new_transition.get(TransitionKey.ACTION)
+        if not isinstance(action, torch.Tensor):
+            return new_transition
+
+        action = _squeeze_batch_dim_if_present(action)
+
+        action_min = torch.tensor(self.action_min, dtype=action.dtype, device=action.device)
+        action_max = torch.tensor(self.action_max, dtype=action.dtype, device=action.device)
+        if action.numel() != action_min.numel():
+            raise ValueError(
+                f"Action dim mismatch: got {action.numel()} values, but action_min/action_max have {action_min.numel()} values."
+            )
+
+        new_transition[TransitionKey.ACTION] = _minmax_unnormalize(action, action_min, action_max)
+        return new_transition
 
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]

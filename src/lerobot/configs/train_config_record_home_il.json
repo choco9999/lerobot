@@ -1,0 +1,153 @@
+{
+    "output_dir": null,
+    "job_name": "record_home_il",
+    "resume": false,
+    "seed": 1000,
+    "num_workers": 4,
+    "batch_size": 128,
+    "steps": 150000,
+    "log_freq": 500,
+    "save_checkpoint": true,
+    "save_freq": 50000,
+    "wandb": {
+        "enable": false,
+        "project": "so101_record_home",
+        "disable_artifact": true
+    },
+    "dataset": {
+        "repo_id": "chocolat-nya/record_home",
+        "use_imagenet_stats": false
+    },
+    "policy": {
+        "repo_id": "chocolat-nya/record_home_il_policy",
+        "type": "sac",
+        "n_obs_steps": 1,
+        "normalization_mapping": {
+            "VISUAL": "MEAN_STD",
+            "STATE": "MIN_MAX",
+            "ENV": "MIN_MAX",
+            "ACTION": "MIN_MAX"
+        },
+        "input_features": {
+            "observation.images.front": {
+                "type": "VISUAL",
+                "shape": [
+                    3,
+                    480,
+                    640
+                ]
+            },
+            "observation.images.wrist": {
+                "type": "VISUAL",
+                "shape": [
+                    3,
+                    480,
+                    640
+                ]
+            },
+            "observation.state": {
+                "type": "STATE",
+                "shape": [
+                    6
+                ]
+            }
+        },
+        "output_features": {
+            "action": {
+                "type": "ACTION",
+                "shape": [
+                    6
+                ]
+            }
+        },
+        "device": "cuda",
+        "use_amp": false,
+        "dataset_stats": {
+            "observation.images.front": {
+                "mean": [
+                    0.5474576361655775,
+                    0.5073489023853006,
+                    0.4401476598543828
+                ],
+                "std": [
+                    0.14422543393761433,
+                    0.17115395719138546,
+                    0.204689477700336
+                ]
+            },
+            "observation.images.wrist": {
+                "mean": [
+                    0.5651548524001268,
+                    0.5369565154831308,
+                    0.47932872241859504
+                ],
+                "std": [
+                    0.19808793203468503,
+                    0.21469665231947563,
+                    0.20837381366736107
+                ]
+            },
+            "observation.state": {
+                "min": [
+                    -35.88441848754883,
+                    -100.0,
+                    -90.9909896850586,
+                    -99.68241119384766,
+                    -92.35127258300781,
+                    1.028938889503479
+                ],
+                "max": [
+                    16.673173904418945,
+                    36.97552490234375,
+                    100.0,
+                    -35.053592681884766,
+                    74.0321044921875,
+                    70.35369873046875
+                ]
+            },
+            "action": {
+                "min": [
+                    -36.26204299926758,
+                    -100.0,
+                    -93.20036315917969,
+                    -100.0,
+                    -92.6229476928711,
+                    0.0
+                ],
+                "max": [
+                    17.225433349609375,
+                    36.2931022644043,
+                    99.00271606445312,
+                    -34.52622985839844,
+                    74.49909210205078,
+                    70.76167297363281
+                ]
+            }
+        },
+        "storage_device": "cuda",
+        "vision_encoder_name": "helper2424/resnet10",
+        "freeze_vision_encoder": true,
+        "image_encoder_hidden_dim": 32,
+        "shared_encoder": true,
+        "critic_network_kwargs": {
+            "hidden_dims": [
+                256,
+                256
+            ],
+            "activate_final": true,
+            "final_activation": null
+        },
+        "actor_network_kwargs": {
+            "hidden_dims": [
+                256,
+                256
+            ],
+            "activate_final": true
+        },
+        "policy_kwargs": {
+            "use_tanh_squash": true,
+            "init_final": 0.05
+        }
+    },
+    "env": null
+}

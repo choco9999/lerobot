@@ -35,12 +35,14 @@ from lerobot.processor import (
     DataProcessorPipeline,
     DeviceProcessorStep,
     EnvTransition,
+    FinalizeHILActionProcessorStep,
     GripperPenaltyProcessorStep,
     ImageCropResizeProcessorStep,
     InterventionActionProcessorStep,
     JointVelocityProcessorStep,
     MapDeltaActionToRobotActionStep,
     MapTensorToDeltaActionDictStep,
+    MinMaxUnnormalizeActionProcessorStep,
     MotorCurrentProcessorStep,
     Numpy2TorchActionProcessorStep,
     RewardClassifierProcessorStep,
@@ -56,6 +58,7 @@ from lerobot.robots import (  # noqa: F401
     RobotConfig,
     make_robot_from_config,
     so100_follower,
+    so101_follower,
 )
 from lerobot.robots.robot import Robot
 from lerobot.robots.so100_follower.robot_kinematic_processor import (
@@ -352,7 +355,13 @@ def make_robot_env(cfg: HILSerlRobotEnvConfig) -> tuple[gym.Env, Any]:
 
 
 def make_processors(
-    env: gym.Env, teleop_device: Teleoperator | None, cfg: HILSerlRobotEnvConfig, device: str = "cpu"
+    env: gym.Env,
+    teleop_device: Teleoperator | None,
+    cfg: HILSerlRobotEnvConfig,
+    device: str = "cpu",
+    *,
+    action_min: list[float] | None = None,
+    action_max: list[float] | None = None,
 ) -> tuple[
     DataProcessorPipeline[EnvTransition, EnvTransition], DataProcessorPipeline[EnvTransition, EnvTransition]
 ]:
@@ -460,12 +469,18 @@ def make_processors(
     env_pipeline_steps.append(DeviceProcessorStep(device=device))
 
     action_pipeline_steps = [
-        AddTeleopActionAsComplimentaryDataStep(teleop_device=teleop_device),
         AddTeleopEventsAsInfoStep(teleop_device=teleop_device),
+        AddTeleopActionAsComplimentaryDataStep(teleop_device=teleop_device),
         InterventionActionProcessorStep(
             use_gripper=cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else False,
             terminate_on_success=terminate_on_success,
+            action_min=action_min,
+            action_max=action_max,
+            normalize_teleop_action=(
+                action_min is not None and action_max is not None and cfg.processor.inverse_kinematics is None
+            ),
         ),
+        FinalizeHILActionProcessorStep(),
     ]
 
     # Replace InverseKinematicsProcessor with new kinematic processors
@@ -497,6 +512,10 @@ def make_processors(
         ]
         action_pipeline_steps.extend(inverse_kinematics_steps)
         action_pipeline_steps.append(RobotActionToPolicyActionProcessorStep(motor_names=motor_names))
+    elif action_min is not None and action_max is not None:
+        action_pipeline_steps.append(
+            MinMaxUnnormalizeActionProcessorStep(action_min=action_min, action_max=action_max)
+        )
 
     return DataProcessorPipeline(
         steps=env_pipeline_steps, to_transition=identity_transition, to_output=identity_transition

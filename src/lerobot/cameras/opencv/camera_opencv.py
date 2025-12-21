@@ -123,6 +123,8 @@ class OpenCVCamera(Camera):
         self.stop_event: Event | None = None
         self.frame_lock: Lock = Lock()
         self.latest_frame: NDArray[Any] | None = None
+        self.latest_frame_timestamp_s: float | None = None
+        self._last_async_timeout_log_s: float = 0.0
         self.new_frame_event: Event = Event()
 
         self.rotation: int | None = get_cv2_rotation(config.rotation)
@@ -445,6 +447,7 @@ class OpenCVCamera(Camera):
 
                 with self.frame_lock:
                     self.latest_frame = color_image
+                    self.latest_frame_timestamp_s = time.monotonic()
                 self.new_frame_event.set()
 
             except DeviceNotConnectedError:
@@ -481,7 +484,10 @@ class OpenCVCamera(Camera):
 
         This method retrieves the most recent frame captured by the background
         read thread. It does not block waiting for the camera hardware directly,
-        but may wait up to timeout_ms for the background thread to provide a frame.
+        and returns a cached frame immediately when one is available (non-blocking).
+        If no frame has been captured yet, it may wait up to `timeout_ms` for the
+        first frame. If a new frame does not arrive within `timeout_ms`, this method
+        may return the latest cached frame (if available and recent) instead of raising.
 
         Args:
             timeout_ms (float): Maximum time in milliseconds to wait for a frame
@@ -493,7 +499,8 @@ class OpenCVCamera(Camera):
 
         Raises:
             DeviceNotConnectedError: If the camera is not connected.
-            TimeoutError: If no frame becomes available within the specified timeout.
+            TimeoutError: If no new frame becomes available within the specified timeout and no
+                recent cached frame is available.
             RuntimeError: If an unexpected error occurs.
         """
         if not self.is_connected:
@@ -502,12 +509,52 @@ class OpenCVCamera(Camera):
         if self.thread is None or not self.thread.is_alive():
             self._start_read_thread()
 
+        # Fast path: return cached frame immediately if it's recent enough.
+        now_s = time.monotonic()
+        max_stale_ms = max(timeout_ms, 1000.0)
+        with self.frame_lock:
+            cached_frame = self.latest_frame
+            cached_ts_s = self.latest_frame_timestamp_s
+
+        if cached_frame is not None and cached_ts_s is not None:
+            age_ms = (now_s - cached_ts_s) * 1000.0
+            if age_ms <= max_stale_ms:
+                # Clear the event if set so callers that *do* wait can detect new frames.
+                if self.new_frame_event.is_set():
+                    self.new_frame_event.clear()
+                return cached_frame
+
         if not self.new_frame_event.wait(timeout=timeout_ms / 1000.0):
-            thread_alive = self.thread is not None and self.thread.is_alive()
-            raise TimeoutError(
-                f"Timed out waiting for frame from camera {self} after {timeout_ms} ms. "
-                f"Read thread alive: {thread_alive}."
-            )
+            with self.frame_lock:
+                frame = self.latest_frame
+                frame_ts_s = self.latest_frame_timestamp_s
+
+            if frame is not None and frame_ts_s is not None:
+                age_ms = (now_s - frame_ts_s) * 1000.0
+                if age_ms <= max_stale_ms:
+                    if now_s - self._last_async_timeout_log_s > 1.0:
+                        logger.warning(
+                            "Timed out waiting for new frame from %s after %.0f ms; "
+                            "returning latest cached frame (age %.0f ms).",
+                            self,
+                            timeout_ms,
+                            age_ms,
+                        )
+                        self._last_async_timeout_log_s = now_s
+                    return frame
+
+            self.new_frame_event.clear()
+            self._start_read_thread()
+            if not self.new_frame_event.wait(timeout=timeout_ms / 1000.0):
+                thread_alive = self.thread is not None and self.thread.is_alive()
+                stale_msg = ""
+                if frame_ts_s is not None:
+                    stale_age_ms = (time.monotonic() - frame_ts_s) * 1000.0
+                    stale_msg = f" Latest cached frame age: {stale_age_ms:.0f} ms."
+                raise TimeoutError(
+                    f"Timed out waiting for frame from camera {self} after {timeout_ms} ms. "
+                    f"Read thread alive: {thread_alive}.{stale_msg}"
+                )
 
         with self.frame_lock:
             frame = self.latest_frame

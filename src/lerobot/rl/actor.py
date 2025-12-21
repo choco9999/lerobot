@@ -24,7 +24,7 @@ Examples of usage:
 
 - Start an actor server for real robot training with human-in-the-loop intervention:
 ```bash
-python -m lerobot.rl.actor --config_path src/lerobot/configs/train_config_hilserl_so100.json
+python -m lerobot.rl.actor --config_path src/lerobot/configs/train_config_hilserl_so101.json
 ```
 
 **NOTE**: The actor server requires a running learner server to connect to. Ensure the learner
@@ -48,14 +48,16 @@ https://github.com/michel-aractingi/lerobot-hilserl-guide
 
 import logging
 import os
+import sys
 import time
+import json
 from functools import lru_cache
-from queue import Empty
+from queue import Empty, Full, Queue as ThreadQueue
 
 import grpc
 import torch
 from torch import nn
-from torch.multiprocessing import Event, Queue
+from torch.multiprocessing import Queue as MpQueue
 
 from lerobot.cameras import opencv  # noqa: F401
 from lerobot.configs import parser
@@ -65,7 +67,7 @@ from lerobot.policies.sac.modeling_sac import SACPolicy
 from lerobot.processor import TransitionKey
 from lerobot.rl.process import ProcessSignalHandler
 from lerobot.rl.queue import get_last_item_from_queue
-from lerobot.robots import so100_follower  # noqa: F401
+from lerobot.robots import so100_follower, so101_follower  # noqa: F401
 from lerobot.teleoperators import gamepad, so101_leader  # noqa: F401
 from lerobot.teleoperators.utils import TeleopEvents
 from lerobot.transport import services_pb2, services_pb2_grpc
@@ -84,6 +86,7 @@ from lerobot.utils.transition import (
     move_state_dict_to_device,
     move_transition_to_device,
 )
+from lerobot.utils.constants import OBS_IMAGE
 from lerobot.utils.utils import (
     TimerManager,
     get_safe_torch_device,
@@ -139,9 +142,16 @@ def actor_cli(cfg: TrainRLServerPipelineConfig):
 
     logging.info("[ACTOR] Connection with Learner established")
 
-    parameters_queue = Queue()
-    transitions_queue = Queue()
-    interactions_queue = Queue()
+    is_threaded = use_threads(cfg)
+    if is_threaded:
+        parameters_queue = ThreadQueue(maxsize=4)
+        # Each item can hold a chunk of large image transitions; keep this small to avoid OOM / jitter.
+        transitions_queue = ThreadQueue(maxsize=4)
+        interactions_queue = ThreadQueue(maxsize=32)
+    else:
+        parameters_queue = MpQueue(maxsize=4)
+        transitions_queue = MpQueue(maxsize=4)
+        interactions_queue = MpQueue(maxsize=32)
 
     concurrency_entity = None
     if use_threads(cfg):
@@ -185,9 +195,10 @@ def actor_cli(cfg: TrainRLServerPipelineConfig):
     logging.info("[ACTOR] Policy process joined")
 
     logging.info("[ACTOR] Closing queues")
-    transitions_queue.close()
-    interactions_queue.close()
-    parameters_queue.close()
+    for q in (transitions_queue, interactions_queue, parameters_queue):
+        close = getattr(q, "close", None)
+        if callable(close):
+            close()
 
     transitions_process.join()
     logging.info("[ACTOR] Transitions process joined")
@@ -197,9 +208,10 @@ def actor_cli(cfg: TrainRLServerPipelineConfig):
     logging.info("[ACTOR] Receive policy process joined")
 
     logging.info("[ACTOR] join queues")
-    transitions_queue.cancel_join_thread()
-    interactions_queue.cancel_join_thread()
-    parameters_queue.cancel_join_thread()
+    for q in (transitions_queue, interactions_queue, parameters_queue):
+        cancel_join_thread = getattr(q, "cancel_join_thread", None)
+        if callable(cancel_join_thread):
+            cancel_join_thread()
 
     logging.info("[ACTOR] queues closed")
 
@@ -210,9 +222,9 @@ def actor_cli(cfg: TrainRLServerPipelineConfig):
 def act_with_policy(
     cfg: TrainRLServerPipelineConfig,
     shutdown_event: any,  # Event,
-    parameters_queue: Queue,
-    transitions_queue: Queue,
-    interactions_queue: Queue,
+    parameters_queue: any,
+    transitions_queue: any,
+    interactions_queue: any,
 ):
     """
     Executes policy interaction within the environment.
@@ -235,170 +247,357 @@ def act_with_policy(
         init_logging(log_file=log_file, display_pid=True)
         logging.info("Actor policy process logging initialized")
 
+    action_chunk_log_f = None
+    last_logged_chunk_id: int | None = None
+    if getattr(cfg.policy, "act_log_action_chunk", False):
+        log_dir = os.path.join(cfg.output_dir, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        action_chunk_log_path = os.path.join(log_dir, f"act_action_chunks_{os.getpid()}.jsonl")
+        action_chunk_log_f = open(action_chunk_log_path, "a", encoding="utf-8")
+        logging.info(f"[ACTOR] ACT action-chunk logging enabled: {action_chunk_log_path}")
+
     logging.info("make_env online")
 
     online_env, teleop_device = make_robot_env(cfg=cfg.env)
-    env_processor, action_processor = make_processors(online_env, teleop_device, cfg.env, cfg.policy.device)
+    try:
+        action_min = None
+        action_max = None
+        if getattr(cfg.policy, "dataset_stats", None) is not None and isinstance(cfg.policy.dataset_stats, dict):
+            action_stats = cfg.policy.dataset_stats.get("action", {})
+            if isinstance(action_stats, dict):
+                action_min = action_stats.get("min")
+                action_max = action_stats.get("max")
 
-    set_seed(cfg.seed)
-    device = get_safe_torch_device(cfg.policy.device, log=True)
-
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cuda.matmul.allow_tf32 = True
-
-    logging.info("make_policy")
-
-    ### Instantiate the policy in both the actor and learner processes
-    ### To avoid sending a SACPolicy object through the port, we create a policy instance
-    ### on both sides, the learner sends the updated parameters every n steps to update the actor's parameters
-    policy: SACPolicy = make_policy(
-        cfg=cfg.policy,
-        env_cfg=cfg.env,
-    )
-    policy = policy.eval()
-    assert isinstance(policy, nn.Module)
-
-    obs, info = online_env.reset()
-    env_processor.reset()
-    action_processor.reset()
-
-    # Process initial observation
-    transition = create_transition(observation=obs, info=info)
-    transition = env_processor(transition)
-
-    # NOTE: For the moment we will solely handle the case of a single environment
-    sum_reward_episode = 0
-    list_transition_to_send_to_learner = []
-    episode_intervention = False
-    # Add counters for intervention rate calculation
-    episode_intervention_steps = 0
-    episode_total_steps = 0
-
-    policy_timer = TimerManager("Policy inference", log=False)
-
-    for interaction_step in range(cfg.policy.online_steps):
-        start_time = time.perf_counter()
-        if shutdown_event.is_set():
-            logging.info("[ACTOR] Shutting down act_with_policy")
-            return
-
-        observation = {
-            k: v for k, v in transition[TransitionKey.OBSERVATION].items() if k in cfg.policy.input_features
-        }
-
-        # Time policy inference and check if it meets FPS requirement
-        with policy_timer:
-            # Extract observation from transition for policy
-            action = policy.select_action(batch=observation)
-        policy_fps = policy_timer.fps_last
-
-        log_policy_frequency_issue(policy_fps=policy_fps, cfg=cfg, interaction_step=interaction_step)
-
-        # Use the new step function
-        new_transition = step_env_and_process_transition(
-            env=online_env,
-            transition=transition,
-            action=action,
-            env_processor=env_processor,
-            action_processor=action_processor,
+        env_processor, action_processor = make_processors(
+            online_env,
+            teleop_device,
+            cfg.env,
+            cfg.policy.device,
+            action_min=action_min,
+            action_max=action_max,
         )
 
-        # Extract values from processed transition
-        next_observation = {
-            k: v
-            for k, v in new_transition[TransitionKey.OBSERVATION].items()
-            if k in cfg.policy.input_features
-        }
+        set_seed(cfg.seed)
+        device = get_safe_torch_device(cfg.policy.device, log=True)
 
-        # Teleop action is the action that was executed in the environment
-        # It is either the action from the teleop device or the action from the policy
-        executed_action = new_transition[TransitionKey.COMPLEMENTARY_DATA]["teleop_action"]
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
 
-        reward = new_transition[TransitionKey.REWARD]
-        done = new_transition.get(TransitionKey.DONE, False)
-        truncated = new_transition.get(TransitionKey.TRUNCATED, False)
+        logging.info("make_policy")
 
-        sum_reward_episode += float(reward)
-        episode_total_steps += 1
+        ### Instantiate the policy in both the actor and learner processes
+        ### To avoid sending a SACPolicy object through the port, we create a policy instance
+        ### on both sides, the learner sends the updated parameters every n steps to update the actor's parameters
+        policy: SACPolicy = make_policy(
+            cfg=cfg.policy,
+            env_cfg=cfg.env,
+        )
+        policy = policy.eval()
+        assert isinstance(policy, nn.Module)
 
-        # Check for intervention from transition info
-        intervention_info = new_transition[TransitionKey.INFO]
-        if intervention_info.get(TeleopEvents.IS_INTERVENTION, False):
-            episode_intervention = True
-            episode_intervention_steps += 1
+        # On real robots, avoid executing a random/uninitialized policy before the learner has
+        # streamed its initial parameters.
+        initial_params_timeout_s = 30.0 if getattr(cfg.env, "name", None) == "real_robot" else 5.0
+        wait_for_initial_policy_parameters(
+            policy=policy,
+            parameters_queue=parameters_queue,
+            device=device,
+            timeout_s=initial_params_timeout_s,
+        )
 
-        complementary_info = {
-            "discrete_penalty": torch.tensor(
-                [new_transition[TransitionKey.COMPLEMENTARY_DATA].get("discrete_penalty", 0.0)]
-            ),
-        }
-        # Create transition for learner (convert to old format)
-        list_transition_to_send_to_learner.append(
-            Transition(
-                state=observation,
-                action=executed_action,
-                reward=reward,
-                next_state=next_observation,
-                done=done,
-                truncated=truncated,
-                complementary_info=complementary_info,
+        obs, info = online_env.reset()
+        env_processor.reset()
+        action_processor.reset()
+        policy.reset()
+
+        # Process initial observation
+        transition = create_transition(observation=obs, info=info)
+        transition = env_processor(transition)
+
+        # NOTE: For the moment we will solely handle the case of a single environment
+        sum_reward_episode = 0
+        pending_transitions: list[Transition] = []
+        episode_intervention = False
+        # Add counters for intervention rate calculation
+        episode_intervention_steps = 0
+        episode_total_steps = 0
+
+        policy_timer = TimerManager("Policy inference", log=False)
+        action_dim = None
+        if cfg.policy is not None:
+            try:
+                action_ft = cfg.policy.action_feature
+                if action_ft is not None and action_ft.shape:
+                    action_dim = int(action_ft.shape[0])
+            except Exception:
+                action_dim = None
+        if action_dim is None:
+            raise ValueError("Could not infer action dimension from policy config.")
+        neutral_action = torch.zeros(action_dim, dtype=torch.float32)
+
+        for interaction_step in range(cfg.policy.online_steps):
+            start_time = time.perf_counter()
+            if shutdown_event.is_set():
+                logging.info("[ACTOR] Shutting down act_with_policy")
+                return
+
+            observation = {
+                k: v
+                for k, v in transition[TransitionKey.OBSERVATION].items()
+                if k in cfg.policy.input_features
+            }
+
+            # If we are currently in a human intervention phase, prioritize control-loop responsiveness
+            # by skipping policy inference (which can be slow) and letting the action processor override
+            # the action with teleop commands.
+            prev_info = transition.get(TransitionKey.INFO, {})
+            is_prev_intervention = False
+            if isinstance(prev_info, dict):
+                is_prev_intervention = bool(
+                    prev_info.get(TeleopEvents.IS_INTERVENTION, False)
+                    or prev_info.get(TeleopEvents.IS_INTERVENTION.value, False)
+                )
+
+            policy_fps: float | None = None
+            if is_prev_intervention:
+                action = neutral_action
+            else:
+                # Time policy inference and check if it meets FPS requirement
+                with policy_timer:
+                    action = policy.select_action(batch=observation)
+                policy_fps = policy_timer.fps_last
+
+            if not is_prev_intervention:
+                if action_chunk_log_f is not None:
+                    act_policy = None
+                    if hasattr(policy, "actor") and hasattr(getattr(policy, "actor"), "act_policy"):
+                        act_policy = getattr(policy.actor, "act_policy")
+                    elif hasattr(policy, "predict_action_chunk"):
+                        act_policy = policy
+
+                    chunk = getattr(act_policy, "_last_action_chunk", None) if act_policy is not None else None
+                    chunk_id = getattr(act_policy, "_last_action_chunk_id", None) if act_policy is not None else None
+                    if (
+                        isinstance(chunk, torch.Tensor)
+                        and isinstance(chunk_id, int)
+                        and chunk_id != last_logged_chunk_id
+                    ):
+                        chunk_cpu = chunk.detach().to("cpu")
+                        record = {
+                            "time": time.time(),
+                            "interaction_step": interaction_step,
+                            "chunk_id": chunk_id,
+                            "chunk_shape": list(chunk_cpu.shape),
+                            "actions": chunk_cpu.tolist(),
+                        }
+                        action_chunk_log_f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                        action_chunk_log_f.flush()
+                        last_logged_chunk_id = chunk_id
+
+                if policy_fps is not None:
+                    log_policy_frequency_issue(
+                        policy_fps=policy_fps, cfg=cfg, interaction_step=interaction_step
+                    )
+
+            try:
+                new_transition = step_env_and_process_transition(
+                    env=online_env,
+                    transition=transition,
+                    action=action,
+                    env_processor=env_processor,
+                    action_processor=action_processor,
+                )
+            except Exception:
+                logging.exception("[ACTOR] Environment step failed; shutting down actor.")
+                shutdown_event.set()
+                return
+
+            # Teleop action is the action that was executed in the environment
+            # It is either the action from the teleop device or the action from the policy
+            executed_action = new_transition[TransitionKey.COMPLEMENTARY_DATA]["teleop_action"]
+
+            reward = new_transition[TransitionKey.REWARD]
+            done = new_transition.get(TransitionKey.DONE, False)
+            truncated = new_transition.get(TransitionKey.TRUNCATED, False)
+
+            sum_reward_episode += float(reward)
+            episode_total_steps += 1
+
+            # Check for intervention from transition info
+            intervention_info = new_transition[TransitionKey.INFO]
+            if intervention_info.get(TeleopEvents.IS_INTERVENTION, False):
+                episode_intervention = True
+                episode_intervention_steps += 1
+
+            complementary_info = {
+                "discrete_penalty": torch.tensor(
+                    [new_transition[TransitionKey.COMPLEMENTARY_DATA].get("discrete_penalty", 0.0)]
+                ),
+                TeleopEvents.IS_INTERVENTION.value: bool(
+                    new_transition[TransitionKey.INFO].get(TeleopEvents.IS_INTERVENTION, False)
+                ),
+            }
+            # Create transition for learner (convert to old format)
+            pending_transitions.append(
+                Transition(
+                    state=observation,
+                    action=executed_action,
+                    reward=reward,
+                    # The replay buffer uses `optimize_memory=True` and derives next_state from the next transition.
+                    # Avoid sending next_state over gRPC to drastically reduce memory / bandwidth usage.
+                    next_state={},
+                    done=done,
+                    truncated=truncated,
+                    complementary_info=complementary_info,
+                )
             )
-        )
 
-        # Update transition for next iteration
-        transition = new_transition
+            # Update transition for next iteration
+            transition = new_transition
 
-        if done or truncated:
-            logging.info(f"[ACTOR] Global step {interaction_step}: Episode reward: {sum_reward_episode}")
-
-            update_policy_parameters(policy=policy, parameters_queue=parameters_queue, device=device)
-
-            if len(list_transition_to_send_to_learner) > 0:
+            # Flush transitions frequently to avoid building huge in-memory buffers which can get the
+            # process killed by the OOM killer when serializing large episodes with images.
+            max_transitions_per_send = 10
+            if not (done or truncated) and len(pending_transitions) >= max_transitions_per_send:
                 push_transitions_to_transport_queue(
-                    transitions=list_transition_to_send_to_learner,
+                    transitions=pending_transitions,
                     transitions_queue=transitions_queue,
+                    serialize_before_put=not use_threads(cfg),
                 )
-                list_transition_to_send_to_learner = []
+                pending_transitions = []
 
-            stats = get_frequency_stats(policy_timer)
-            policy_timer.reset()
-
-            # Calculate intervention rate
-            intervention_rate = 0.0
-            if episode_total_steps > 0:
-                intervention_rate = episode_intervention_steps / episode_total_steps
-
-            # Send episodic reward to the learner
-            interactions_queue.put(
-                python_object_to_bytes(
-                    {
-                        "Episodic reward": sum_reward_episode,
-                        "Interaction step": interaction_step,
-                        "Episode intervention": int(episode_intervention),
-                        "Intervention rate": intervention_rate,
-                        **stats,
-                    }
+            if done or truncated:
+                logging.info(
+                    f"[ACTOR] Global step {interaction_step}: Episode reward: {sum_reward_episode}"
                 )
-            )
 
-            # Reset intervention counters and environment
-            sum_reward_episode = 0.0
-            episode_intervention = False
-            episode_intervention_steps = 0
-            episode_total_steps = 0
+                episode_success: bool | None = None
+                if (
+                    cfg.env.processor.reset is not None
+                    and getattr(cfg.env.processor.reset, "prompt_success_failure", False)
+                ):
+                    # Keep the terminal transition local until the user provides the outcome label.
+                    terminal_transition: Transition | None = None
+                    if pending_transitions:
+                        terminal_transition = pending_transitions.pop()
 
-            # Reset environment and processors
-            obs, info = online_env.reset()
-            env_processor.reset()
-            action_processor.reset()
+                    if pending_transitions:
+                        push_transitions_to_transport_queue(
+                            transitions=pending_transitions,
+                            transitions_queue=transitions_queue,
+                            serialize_before_put=not use_threads(cfg),
+                        )
+                        pending_transitions = []
 
-            # Process initial observation
-            transition = create_transition(observation=obs, info=info)
-            transition = env_processor(transition)
+                    try:
+                        episode_success = prompt_episode_success_failure(teleop_device=teleop_device)
+                    except KeyboardInterrupt:
+                        logging.info("[ACTOR] Episode outcome prompt interrupted; shutting down actor.")
+                        shutdown_event.set()
+                        return
 
-        if cfg.env.fps is not None:
-            dt_time = time.perf_counter() - start_time
-            precise_sleep(1 / cfg.env.fps - dt_time)
+                    # Overwrite the terminal transition reward/done flags based on the label.
+                    # This is useful when episodes end via time limits (truncation) and the
+                    # outcome must be provided by the user.
+                    if terminal_transition is not None:
+                        previous_reward = float(terminal_transition["reward"])
+                        terminal_transition["reward"] = float(episode_success)
+                        terminal_transition["done"] = True
+                        terminal_transition["truncated"] = False
+                        pending_transitions.append(terminal_transition)
+                        sum_reward_episode += float(episode_success) - previous_reward
+
+                update_policy_parameters(policy=policy, parameters_queue=parameters_queue, device=device)
+
+                if pending_transitions:
+                    push_transitions_to_transport_queue(
+                        transitions=pending_transitions,
+                        transitions_queue=transitions_queue,
+                        serialize_before_put=not use_threads(cfg),
+                    )
+                    pending_transitions = []
+
+                stats = get_frequency_stats(policy_timer)
+                policy_timer.reset()
+
+                # Calculate intervention rate
+                intervention_rate = 0.0
+                if episode_total_steps > 0:
+                    intervention_rate = episode_intervention_steps / episode_total_steps
+
+                # Send episodic reward to the learner
+                interactions_queue.put(
+                    python_object_to_bytes(
+                        {
+                            "Episodic reward": sum_reward_episode,
+                            "Interaction step": interaction_step,
+                            "Episode intervention": int(episode_intervention),
+                            "Intervention rate": intervention_rate,
+                            **(
+                                {"Episode success": int(episode_success)}
+                                if episode_success is not None
+                                else {}
+                            ),
+                            **stats,
+                        }
+                    )
+                )
+
+                # Reset intervention counters and environment
+                sum_reward_episode = 0.0
+                episode_intervention = False
+                episode_intervention_steps = 0
+                episode_total_steps = 0
+
+                # Reset environment and processors
+                obs, info = online_env.reset()
+                env_processor.reset()
+                action_processor.reset()
+                policy.reset()
+
+                # Process initial observation
+                transition = create_transition(observation=obs, info=info)
+                transition = env_processor(transition)
+
+            if cfg.env.fps is not None:
+                dt_time = time.perf_counter() - start_time
+                target_dt = 1 / cfg.env.fps
+                if dt_time > 2 * target_dt:
+                    now_s = time.monotonic()
+                    last_slow_log_s = getattr(act_with_policy, "_last_slow_step_log_s", 0.0)
+                    if now_s - last_slow_log_s >= 1.0:
+                        qsize = None
+                        try:
+                            qsize = transitions_queue.qsize()
+                        except Exception:
+                            qsize = None
+                        logging.warning(
+                            "[ACTOR] Slow control step %.0f ms (target %.0f ms). transitions_queue=%s",
+                            dt_time * 1000.0,
+                            target_dt * 1000.0,
+                            qsize if qsize is not None else "n/a",
+                        )
+                        setattr(act_with_policy, "_last_slow_step_log_s", now_s)
+                precise_sleep(1 / cfg.env.fps - dt_time)
+    finally:
+        if action_chunk_log_f is not None:
+            try:
+                action_chunk_log_f.close()
+            except Exception:
+                logging.exception("[ACTOR] Failed to close action chunk log file cleanly.")
+
+        if teleop_device is not None:
+            try:
+                if getattr(teleop_device, "is_connected", False):
+                    teleop_device.disconnect()
+            except Exception:
+                logging.exception("[ACTOR] Failed to disconnect teleop device cleanly.")
+
+        try:
+            if hasattr(online_env, "close"):
+                online_env.close()
+        except Exception:
+            logging.exception("[ACTOR] Failed to close environment cleanly.")
 
 
 #  Communication Functions - Group all gRPC/messaging functions
@@ -406,7 +605,7 @@ def act_with_policy(
 
 def establish_learner_connection(
     stub: services_pb2_grpc.LearnerServiceStub,
-    shutdown_event: Event,  # type: ignore
+    shutdown_event: any,
     attempts: int = 30,
 ):
     """Establish a connection with the learner.
@@ -457,8 +656,8 @@ def learner_service_client(
 
 def receive_policy(
     cfg: TrainRLServerPipelineConfig,
-    parameters_queue: Queue,
-    shutdown_event: Event,  # type: ignore
+    parameters_queue: any,
+    shutdown_event: any,
     learner_client: services_pb2_grpc.LearnerServiceStub | None = None,
     grpc_channel: grpc.Channel | None = None,
 ):
@@ -509,8 +708,8 @@ def receive_policy(
 
 def send_transitions(
     cfg: TrainRLServerPipelineConfig,
-    transitions_queue: Queue,
-    shutdown_event: any,  # Event,
+    transitions_queue: any,
+    shutdown_event: any,
     learner_client: services_pb2_grpc.LearnerServiceStub | None = None,
     grpc_channel: grpc.Channel | None = None,
 ) -> services_pb2.Empty:
@@ -559,8 +758,8 @@ def send_transitions(
 
 def send_interactions(
     cfg: TrainRLServerPipelineConfig,
-    interactions_queue: Queue,
-    shutdown_event: Event,  # type: ignore
+    interactions_queue: any,
+    shutdown_event: any,
     learner_client: services_pb2_grpc.LearnerServiceStub | None = None,
     grpc_channel: grpc.Channel | None = None,
 ) -> services_pb2.Empty:
@@ -610,7 +809,51 @@ def send_interactions(
     logging.info("[ACTOR] Interactions process stopped")
 
 
-def transitions_stream(shutdown_event: Event, transitions_queue: Queue, timeout: float) -> services_pb2.Empty:  # type: ignore
+def _compress_image_tensor_to_uint8(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.dtype == torch.uint8:
+        return tensor
+    if tensor.is_floating_point():
+        return (tensor * 255.0).round().clamp(0, 255).to(torch.uint8)
+    return tensor.to(torch.uint8)
+
+
+def _serialize_transitions_chunk(transitions: list[Transition]) -> bytes:
+    """Convert a chunk of transitions to bytes, compressing image tensors to uint8 first.
+
+    Note: We compress images *before* moving to CPU so that CUDA->CPU transfers are smaller.
+    """
+    transition_to_send: list[Transition] = []
+
+    for transition in transitions:
+        tr: Transition = transition
+
+        # Compress observation images.
+        state = tr.get("state", {})
+        if isinstance(state, dict) and state:
+            new_state = dict(state)
+            for key, value in state.items():
+                if isinstance(key, str) and key.startswith(OBS_IMAGE) and isinstance(value, torch.Tensor):
+                    new_state[key] = _compress_image_tensor_to_uint8(value)
+            tr = dict(tr)
+            tr["state"] = new_state
+
+        # Compress next_state images if present.
+        next_state = tr.get("next_state", {})
+        if isinstance(next_state, dict) and next_state:
+            new_next_state = dict(next_state)
+            for key, value in next_state.items():
+                if isinstance(key, str) and key.startswith(OBS_IMAGE) and isinstance(value, torch.Tensor):
+                    new_next_state[key] = _compress_image_tensor_to_uint8(value)
+            tr = dict(tr)
+            tr["next_state"] = new_next_state
+
+        tr_cpu = move_transition_to_device(transition=tr, device="cpu")
+        transition_to_send.append(tr_cpu)
+
+    return transitions_to_bytes(transition_to_send)
+
+
+def transitions_stream(shutdown_event: any, transitions_queue: any, timeout: float) -> services_pb2.Empty:  # type: ignore
     while not shutdown_event.is_set():
         try:
             message = transitions_queue.get(block=True, timeout=timeout)
@@ -618,16 +861,28 @@ def transitions_stream(shutdown_event: Event, transitions_queue: Queue, timeout:
             logging.debug("[ACTOR] Transition queue is empty")
             continue
 
+        try:
+            if isinstance(message, (list, tuple)):
+                message = _serialize_transitions_chunk(list(message))
+            if not isinstance(message, (bytes, bytearray)):
+                logging.warning(
+                    "[ACTOR] Unexpected transitions queue message type: %s", type(message).__name__
+                )
+                continue
+        except Exception:  # noqa: BLE001
+            logging.exception("[ACTOR] Failed to serialize transitions message; dropping it.")
+            continue
+
         yield from send_bytes_in_chunks(
-            message, services_pb2.Transition, log_prefix="[ACTOR] Send transitions"
+            bytes(message), services_pb2.Transition, log_prefix="[ACTOR] Send transitions"
         )
 
     return services_pb2.Empty()
 
 
 def interactions_stream(
-    shutdown_event: Event,
-    interactions_queue: Queue,
+    shutdown_event: any,
+    interactions_queue: any,
     timeout: float,  # type: ignore
 ) -> services_pb2.Empty:
     while not shutdown_event.is_set():
@@ -649,56 +904,99 @@ def interactions_stream(
 #  Policy functions
 
 
-def update_policy_parameters(policy: SACPolicy, parameters_queue: Queue, device):
+def update_policy_parameters(policy: SACPolicy, parameters_queue: any, device):
     bytes_state_dict = get_last_item_from_queue(parameters_queue, block=False)
     if bytes_state_dict is not None:
-        logging.info("[ACTOR] Load new parameters from Learner.")
-        state_dicts = bytes_to_state_dict(bytes_state_dict)
+        _load_policy_parameters_from_bytes(policy=policy, bytes_state_dict=bytes_state_dict, device=device)
 
-        # TODO: check encoder parameter synchronization possible issues:
-        # 1. When shared_encoder=True, we're loading stale encoder params from actor's state_dict
-        #    instead of the updated encoder params from critic (which is optimized separately)
-        # 2. When freeze_vision_encoder=True, we waste bandwidth sending/loading frozen params
-        # 3. Need to handle encoder params correctly for both actor and discrete_critic
-        # Potential fixes:
-        # - Send critic's encoder state when shared_encoder=True
-        # - Skip encoder params entirely when freeze_vision_encoder=True
-        # - Ensure discrete_critic gets correct encoder state (currently uses encoder_critic)
 
-        # Load actor state dict
-        actor_state_dict = move_state_dict_to_device(state_dicts["policy"], device=device)
-        policy.actor.load_state_dict(actor_state_dict)
+def _load_policy_parameters_from_bytes(policy: SACPolicy, bytes_state_dict: bytes, device) -> None:
+    logging.info("[ACTOR] Load new parameters from Learner.")
+    state_dicts = bytes_to_state_dict(bytes_state_dict)
 
-        # Load discrete critic if present
-        if hasattr(policy, "discrete_critic") and "discrete_critic" in state_dicts:
-            discrete_critic_state_dict = move_state_dict_to_device(
-                state_dicts["discrete_critic"], device=device
-            )
-            policy.discrete_critic.load_state_dict(discrete_critic_state_dict)
-            logging.info("[ACTOR] Loaded discrete critic parameters from Learner.")
+    # TODO: check encoder parameter synchronization possible issues:
+    # 1. When shared_encoder=True, we're loading stale encoder params from actor's state_dict
+    #    instead of the updated encoder params from critic (which is optimized separately)
+    # 2. When freeze_vision_encoder=True, we waste bandwidth sending/loading frozen params
+    # 3. Need to handle encoder params correctly for both actor and discrete_critic
+    # Potential fixes:
+    # - Send critic's encoder state when shared_encoder=True
+    # - Skip encoder params entirely when freeze_vision_encoder=True
+    # - Ensure discrete_critic gets correct encoder state (currently uses encoder_critic)
+
+    # Load actor state dict
+    actor_state_dict = move_state_dict_to_device(state_dicts["policy"], device=device)
+    policy.actor.load_state_dict(actor_state_dict)
+
+    # Load discrete critic if present
+    if hasattr(policy, "discrete_critic") and "discrete_critic" in state_dicts:
+        discrete_critic_state_dict = move_state_dict_to_device(state_dicts["discrete_critic"], device=device)
+        policy.discrete_critic.load_state_dict(discrete_critic_state_dict)
+        logging.info("[ACTOR] Loaded discrete critic parameters from Learner.")
+
+
+def wait_for_initial_policy_parameters(
+    policy: SACPolicy,
+    parameters_queue: any,
+    *,
+    device,
+    timeout_s: float = 30.0,
+) -> None:
+    """Best-effort wait for the first learner parameters before moving the robot."""
+    deadline_s = time.monotonic() + max(timeout_s, 0.0)
+    while time.monotonic() < deadline_s:
+        remaining = max(0.0, deadline_s - time.monotonic())
+        bytes_state_dict = get_last_item_from_queue(
+            parameters_queue, block=True, timeout=min(0.5, remaining)
+        )
+        if bytes_state_dict is None:
+            continue
+        _load_policy_parameters_from_bytes(policy=policy, bytes_state_dict=bytes_state_dict, device=device)
+        return
+
+    logging.warning(
+        "[ACTOR] Timed out waiting for initial parameters from Learner (%.1fs); "
+        "continuing with local policy weights.",
+        timeout_s,
+    )
 
 
 #  Utilities functions
 
 
-def push_transitions_to_transport_queue(transitions: list, transitions_queue):
-    """Send transitions to learner in smaller chunks to avoid network issues.
+def push_transitions_to_transport_queue(
+    transitions: list[Transition],
+    transitions_queue: any,
+    *,
+    max_transitions_per_message: int = 10,
+    serialize_before_put: bool = True,
+) -> None:
+    """Enqueue transitions to be sent to the learner.
 
-    Args:
-        transitions: List of transitions to send
-        message_queue: Queue to send messages to learner
-        chunk_size: Size of each chunk to send
+    When `serialize_before_put=True` (default), transitions are serialized to bytes in this
+    function. When False, raw transition chunks are enqueued and serialization is done in
+    the transitions sender thread/process.
     """
-    transition_to_send_to_learner = []
-    for transition in transitions:
-        tr = move_transition_to_device(transition=transition, device="cpu")
-        for key, value in tr["state"].items():
-            if torch.isnan(value).any():
-                logging.warning(f"Found NaN values in transition {key}")
+    if not transitions:
+        return
 
-        transition_to_send_to_learner.append(tr)
+    now_s = time.monotonic()
+    last_log_s = getattr(push_transitions_to_transport_queue, "_last_full_log_s", 0.0)
 
-    transitions_queue.put(transitions_to_bytes(transition_to_send_to_learner))
+    for start in range(0, len(transitions), max_transitions_per_message):
+        chunk = transitions[start : start + max_transitions_per_message]
+        try:
+            payload = _serialize_transitions_chunk(chunk) if serialize_before_put else chunk
+            transitions_queue.put(payload, block=False)
+        except Full:
+            if now_s - last_log_s >= 1.0:
+                logging.warning(
+                    "[ACTOR] Transitions queue full; dropping %d transitions.", len(chunk)
+                )
+                last_log_s = now_s
+                setattr(push_transitions_to_transport_queue, "_last_full_log_s", last_log_s)
+        except Exception:  # noqa: BLE001
+            logging.exception("[ACTOR] Failed to enqueue transitions; dropping them.")
 
 
 def get_frequency_stats(timer: TimerManager) -> dict[str, float]:
@@ -732,6 +1030,65 @@ def log_policy_frequency_issue(policy_fps: float, cfg: TrainRLServerPipelineConf
 
 def use_threads(cfg: TrainRLServerPipelineConfig) -> bool:
     return cfg.policy.concurrency.actor == "threads"
+
+
+def _read_single_keypress() -> str:
+    """Read a single keypress from stdin (best-effort, cross-platform)."""
+    if os.name == "nt":
+        import msvcrt  # noqa: PLC0415
+
+        ch = msvcrt.getch()
+        # Handle special keys (arrows, function keys) which come as a prefix byte.
+        if ch in (b"\x00", b"\xe0"):
+            ch = msvcrt.getch()
+        return ch.decode(errors="ignore")
+
+    import termios  # noqa: PLC0415
+    import tty  # noqa: PLC0415
+
+    fd = sys.stdin.fileno()
+    if not sys.stdin.isatty():
+        return sys.stdin.read(1)
+
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        return sys.stdin.read(1)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
+def _flush_teleop_events(teleop_device) -> None:
+    getter = getattr(teleop_device, "get_teleop_events", None)
+    if not callable(getter):
+        return
+    try:
+        # Consume any queued key events so they don't leak into the next episode.
+        getter()
+    except Exception:
+        logging.debug("[ACTOR] Failed to flush teleop events.", exc_info=True)
+
+
+def prompt_episode_success_failure(teleop_device) -> bool:
+    """Block until the user labels the episode as success ('s') or failure (Esc)."""
+    print("\nEpisode finished. Press 's' for SUCCESS, or Esc for FAILURE.", flush=True)
+
+    while True:
+        if sys.stdin.isatty():
+            key = _read_single_keypress()
+        else:
+            key = input("Type 's' for success or 'esc' for failure: ").strip()
+
+        if key in {"s", "S"}:
+            _flush_teleop_events(teleop_device)
+            print("Marked as SUCCESS.", flush=True)
+            return True
+        if key == "\x1b" or str(key).strip().lower() in {"esc", "escape"}:
+            _flush_teleop_events(teleop_device)
+            print("Marked as FAILURE.", flush=True)
+            return False
+
+        print("Invalid input. Press 's' or Esc.", flush=True)
 
 
 if __name__ == "__main__":

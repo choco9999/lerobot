@@ -16,6 +16,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import NormalizationMode
@@ -237,6 +238,52 @@ class SACConfig(PreTrainedConfig):
     @property
     def action_delta_indices(self) -> list:
         return None  # SAC typically predicts one action at a time
+
+
+@PreTrainedConfig.register_subclass("sac_act")
+@dataclass
+class SACActConfig(SACConfig):
+    """SAC configuration that initializes (and fine-tunes) the actor from a pretrained ACT checkpoint.
+
+    This is intended for "ACT imitation -> HIL-SERL RL" workflows where you want to start RL from an
+    existing ACT policy. The critic and temperature are standard SAC components; only the actor is
+    replaced by an ACT-backed stochastic actor.
+    """
+
+    # Path to the ACT policy directory that contains `config.json` and `model.safetensors`
+    # (typically: `.../checkpoints/<step>/pretrained_model/`).
+    act_pretrained_path: Path | None = None
+
+    # If True, load and apply the ACT `policy_preprocessor.json` pipeline before feeding observations
+    # to the ACT model. This helps match the observation normalization used during ACT training.
+    act_use_preprocessor: bool = True
+
+    # If True, load and apply the ACT `policy_postprocessor.json` pipeline to the ACT action outputs.
+    # This is typically required when ACT was trained with ACTION normalization modes like MEAN_STD.
+    act_use_postprocessor: bool = True
+
+    # If True, use ACT prior deterministically during inference (distribution mode) instead of sampling.
+    act_deterministic_inference: bool = False
+
+    # If True, use the underlying ACT action-queue logic (ACTPolicy.select_action) during inference.
+    # This matches ACT's action-chunk execution, but is open-loop for `n_action_steps > 1`.
+    act_use_action_queue: bool = False
+
+    # Which action index to use from ACT's predicted action chunk.
+    # 0 means "use the first action in the chunk".
+    act_action_index: int = 0
+
+    # Initial standard deviation (in tanh-Gaussian base space) for the stochastic actor built on top of ACT.
+    act_init_std: float = 0.2
+
+    # If True, the RL actor process logs ACT's predicted action chunks (shape: B x chunk_size x action_dim)
+    # to a JSONL file under `<output_dir>/logs/`.
+    act_log_action_chunk: bool = False
+
+    def __post_init__(self):
+        super().__post_init__()
+        # Actor/critic encoders cannot be shared when the actor is ACT-backed.
+        self.shared_encoder = False
 
     @property
     def reward_delta_indices(self) -> None:

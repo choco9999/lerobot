@@ -469,7 +469,7 @@ class Eagle25VLImageProcessorFast(BaseImageProcessorFast):
         resample = kwargs.pop("resample", self.resample)
         kwargs["interpolation"] = (
             pil_torch_interpolation_mapping[resample]
-            if isinstance(resample, PILImageResampling | int)
+            if isinstance(resample, (PILImageResampling, int))
             else resample
         )
 

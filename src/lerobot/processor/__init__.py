@@ -43,9 +43,11 @@ from .gym_action_processor import (
 from .hil_processor import (
     AddTeleopActionAsComplimentaryDataStep,
     AddTeleopEventsAsInfoStep,
+    FinalizeHILActionProcessorStep,
     GripperPenaltyProcessorStep,
     ImageCropResizeProcessorStep,
     InterventionActionProcessorStep,
+    MinMaxUnnormalizeActionProcessorStep,
     RewardClassifierProcessorStep,
     TimeLimitProcessorStep,
 )
@@ -82,6 +84,7 @@ __all__ = [
     "AddTeleopActionAsComplimentaryDataStep",
     "AddTeleopEventsAsInfoStep",
     "ComplementaryDataProcessorStep",
+    "FinalizeHILActionProcessorStep",
     "batch_to_transition",
     "create_transition",
     "DeviceProcessorStep",
@@ -120,6 +123,7 @@ __all__ = [
     "DataProcessorPipeline",
     "TimeLimitProcessorStep",
     "AddBatchDimensionProcessorStep",
+    "MinMaxUnnormalizeActionProcessorStep",
     "RobotProcessorPipeline",
     "TokenizerProcessorStep",
     "Torch2NumpyActionProcessorStep",
