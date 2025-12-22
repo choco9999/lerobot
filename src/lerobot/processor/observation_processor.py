@@ -52,6 +52,8 @@ class VanillaObservationProcessorStep(ObservationProcessorStep):
     -   Adds a batch dimension if one is not already present.
     """
 
+    keep_images_as_uint8: bool = False
+
     def _process_single_image(self, img: np.ndarray) -> Tensor:
         """
         Processes a single NumPy image array into a channel-first, normalized tensor.
@@ -86,8 +88,11 @@ class VanillaObservationProcessorStep(ObservationProcessorStep):
         # Convert to channel-first format
         img_tensor = einops.rearrange(img_tensor, "b h w c -> b c h w").contiguous()
 
+        if self.keep_images_as_uint8:
+            return img_tensor
+
         # Convert to float32 and normalize to [0, 1]
-        img_tensor = img_tensor.type(torch.float32) / 255.0
+        img_tensor = img_tensor.to(dtype=torch.float32).div_(255.0)
 
         return img_tensor
 

@@ -269,6 +269,15 @@ class SACActConfig(SACConfig):
     # This matches ACT's action-chunk execution, but is open-loop for `n_action_steps > 1`.
     act_use_action_queue: bool = False
 
+    # If True, prefetch the next ACT action chunk in a background thread when using
+    # `act_use_action_queue=True`. This avoids occasional control-loop stalls when the
+    # ACT queue is refreshed (common on real robots).
+    act_prefetch_action_queue: bool = False
+
+    # Start prefetch when the ACT action-queue has <= this many remaining actions.
+    # Only used when `act_prefetch_action_queue=True`.
+    act_prefetch_min_queue_len: int = 10
+
     # Which action index to use from ACT's predicted action chunk.
     # 0 means "use the first action in the chunk".
     act_action_index: int = 0

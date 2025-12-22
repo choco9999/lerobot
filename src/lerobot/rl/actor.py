@@ -268,13 +268,22 @@ def act_with_policy(
                 action_min = action_stats.get("min")
                 action_max = action_stats.get("max")
 
+        processor_device = cfg.policy.device
+        keep_images_as_uint8 = False
+        if getattr(cfg.env, "name", None) == "real_robot":
+            # Keep all environment-side tensors on CPU and keep images as uint8 to reduce
+            # control-loop jitter. We convert/move only the subset needed for policy inference.
+            processor_device = "cpu"
+            keep_images_as_uint8 = True
+
         env_processor, action_processor = make_processors(
             online_env,
             teleop_device,
             cfg.env,
-            cfg.policy.device,
+            processor_device,
             action_min=action_min,
             action_max=action_max,
+            keep_images_as_uint8=keep_images_as_uint8,
         )
 
         set_seed(cfg.seed)
@@ -321,8 +330,17 @@ def act_with_policy(
         # Add counters for intervention rate calculation
         episode_intervention_steps = 0
         episode_total_steps = 0
+        last_intervention_state = False
+        prev_info = transition.get(TransitionKey.INFO, {})
+        if isinstance(prev_info, dict):
+            last_intervention_state = bool(
+                prev_info.get(TeleopEvents.IS_INTERVENTION, False)
+                or prev_info.get(TeleopEvents.IS_INTERVENTION.value, False)
+            )
 
         policy_timer = TimerManager("Policy inference", log=False)
+        last_policy_ms: float | None = None
+        last_act_queue_len: int | None = None
         action_dim = None
         if cfg.policy is not None:
             try:
@@ -334,6 +352,37 @@ def act_with_policy(
         if action_dim is None:
             raise ValueError("Could not infer action dimension from policy config.")
         neutral_action = torch.zeros(action_dim, dtype=torch.float32)
+
+        def _can_skip_observation_for_action_queue(policy: SACPolicy) -> bool:
+            cfg_obj = getattr(policy, "config", None)
+            if not getattr(cfg_obj, "act_use_action_queue", False):
+                return False
+            actor_obj = getattr(policy, "actor", None)
+            act_policy = getattr(actor_obj, "act_policy", None)
+            if act_policy is None:
+                return False
+            if getattr(getattr(act_policy, "config", None), "temporal_ensemble_coeff", None) is not None:
+                return False
+            q = getattr(act_policy, "_action_queue", None)
+            try:
+                return q is not None and len(q) > 0
+            except Exception:
+                return False
+
+        def _prepare_observation_for_policy(observation: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+            prepared: dict[str, torch.Tensor] = {}
+            for key, value in observation.items():
+                if not isinstance(value, torch.Tensor):
+                    prepared[key] = value
+                    continue
+                if isinstance(key, str) and key.startswith(OBS_IMAGE) and value.dtype == torch.uint8:
+                    value = value.to(device=device, dtype=torch.float32, non_blocking=True).div_(255.0)
+                elif value.is_floating_point():
+                    value = value.to(device=device, dtype=torch.float32, non_blocking=True)
+                else:
+                    value = value.to(device=device, non_blocking=True)
+                prepared[key] = value
+            return prepared
 
         for interaction_step in range(cfg.policy.online_steps):
             start_time = time.perf_counter()
@@ -364,8 +413,24 @@ def act_with_policy(
             else:
                 # Time policy inference and check if it meets FPS requirement
                 with policy_timer:
-                    action = policy.select_action(batch=observation)
+                    if _can_skip_observation_for_action_queue(policy):
+                        # Pass the (CPU) observation so the policy can use it for background ACT prefetch,
+                        # while still avoiding expensive device transfers in the control loop.
+                        action = policy.select_action(batch=observation)
+                    else:
+                        action = policy.select_action(batch=_prepare_observation_for_policy(observation))
+                # Keep env-side control on CPU to avoid GPU sync/jitter.
+                if isinstance(action, torch.Tensor) and action.device.type != "cpu":
+                    action = action.detach().to("cpu")
                 policy_fps = policy_timer.fps_last
+                last_policy_ms = policy_timer.last * 1000.0
+                try:
+                    actor_obj = getattr(policy, "actor", None)
+                    act_policy = getattr(actor_obj, "act_policy", None)
+                    q = getattr(act_policy, "_action_queue", None)
+                    last_act_queue_len = len(q) if q is not None else None
+                except Exception:
+                    last_act_queue_len = None
 
             if not is_prev_intervention:
                 if action_chunk_log_f is not None:
@@ -454,6 +519,24 @@ def act_with_policy(
 
             # Update transition for next iteration
             transition = new_transition
+            current_intervention_state = False
+            current_info = transition.get(TransitionKey.INFO, {})
+            if isinstance(current_info, dict):
+                current_intervention_state = bool(
+                    current_info.get(TeleopEvents.IS_INTERVENTION, False)
+                    or current_info.get(TeleopEvents.IS_INTERVENTION.value, False)
+                )
+            if current_intervention_state != last_intervention_state:
+                logging.info(
+                    "[ACTOR] Human intervention toggled %s",
+                    "ON" if current_intervention_state else "OFF",
+                )
+                # Clear ACT/policy internal queues so we don't execute stale actions across the boundary.
+                try:
+                    policy.reset()
+                except Exception:
+                    logging.exception("[ACTOR] Failed to reset policy on intervention toggle.")
+                last_intervention_state = current_intervention_state
 
             # Flush transitions frequently to avoid building huge in-memory buffers which can get the
             # process killed by the OOM killer when serializing large episodes with images.
@@ -558,11 +641,18 @@ def act_with_policy(
                 # Process initial observation
                 transition = create_transition(observation=obs, info=info)
                 transition = env_processor(transition)
+                prev_info = transition.get(TransitionKey.INFO, {})
+                last_intervention_state = False
+                if isinstance(prev_info, dict):
+                    last_intervention_state = bool(
+                        prev_info.get(TeleopEvents.IS_INTERVENTION, False)
+                        or prev_info.get(TeleopEvents.IS_INTERVENTION.value, False)
+                    )
 
             if cfg.env.fps is not None:
                 dt_time = time.perf_counter() - start_time
                 target_dt = 1 / cfg.env.fps
-                if dt_time > 2 * target_dt:
+                if not (done or truncated) and dt_time > 2 * target_dt:
                     now_s = time.monotonic()
                     last_slow_log_s = getattr(act_with_policy, "_last_slow_step_log_s", 0.0)
                     if now_s - last_slow_log_s >= 1.0:
@@ -571,11 +661,22 @@ def act_with_policy(
                             qsize = transitions_queue.qsize()
                         except Exception:
                             qsize = None
+                        info = transition.get(TransitionKey.INFO, {})
+                        timing = ""
+                        if isinstance(info, dict) and "_timing_total_ms" in info:
+                            timing = (
+                                f" breakdown(action_proc={info.get('_timing_action_processor_ms', 0.0):.0f}ms,"
+                                f" env_step={info.get('_timing_env_step_ms', 0.0):.0f}ms,"
+                                f" env_proc={info.get('_timing_env_processor_ms', 0.0):.0f}ms)"
+                            )
                         logging.warning(
-                            "[ACTOR] Slow control step %.0f ms (target %.0f ms). transitions_queue=%s",
+                            "[ACTOR] Slow control step %.0f ms (target %.0f ms). transitions_queue=%s policy=%.0fms act_q=%s%s",
                             dt_time * 1000.0,
                             target_dt * 1000.0,
                             qsize if qsize is not None else "n/a",
+                            last_policy_ms if last_policy_ms is not None else 0.0,
+                            last_act_queue_len if last_act_queue_len is not None else "n/a",
+                            timing,
                         )
                         setattr(act_with_policy, "_last_slow_step_log_s", now_s)
                 precise_sleep(1 / cfg.env.fps - dt_time)

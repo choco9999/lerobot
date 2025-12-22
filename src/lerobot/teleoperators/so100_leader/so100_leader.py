@@ -75,6 +75,7 @@ class SO100Leader(Teleoperator):
         self._pending_terminate_episode = False
         self._pending_success = False
         self._pending_rerecord_episode = False
+        self._space_pressed = False
         self._last_action: dict[str, float] | None = None
 
     @property
@@ -103,7 +104,9 @@ class SO100Leader(Teleoperator):
         self.configure()
 
         if PYNPUT_AVAILABLE and pynput_keyboard is not None:
-            self._keyboard_listener = pynput_keyboard.Listener(on_press=self._on_key_press)
+            self._keyboard_listener = pynput_keyboard.Listener(
+                on_press=self._on_key_press, on_release=self._on_key_release
+            )
             self._keyboard_listener.start()
 
         logger.info(f"{self} connected.")
@@ -114,12 +117,24 @@ class SO100Leader(Teleoperator):
 
         try:
             if key == pynput_keyboard.Key.space:
-                self._event_queue.put("space")
+                # Debounce key repeat while space is held down.
+                if not self._space_pressed:
+                    self._space_pressed = True
+                    self._event_queue.put("space")
             elif key == pynput_keyboard.Key.esc:
                 self._event_queue.put("esc")
             elif hasattr(key, "char") and key.char is not None:
                 if key.char in {"s", "r", "q"}:
                     self._event_queue.put(key.char)
+        except Exception:  # noqa: BLE001
+            return
+
+    def _on_key_release(self, key) -> None:
+        if not PYNPUT_AVAILABLE or pynput_keyboard is None:
+            return
+        try:
+            if key == pynput_keyboard.Key.space:
+                self._space_pressed = False
         except Exception:  # noqa: BLE001
             return
 

@@ -162,7 +162,10 @@ class AddTeleopActionAsComplimentaryDataStep(ComplementaryDataProcessorStep):
         try:
             new_complementary_data[TELEOP_ACTION_KEY] = self.teleop_device.get_action()
         except Exception as e:  # noqa: BLE001
-            logger.warning("Failed to read teleop action (%s); using policy action.", e)
+            logger.warning(
+                "Failed to read teleop action (%s); intervention will fall back to holding the current pose.",
+                e,
+            )
             new_complementary_data[TELEOP_ACTION_KEY] = None
         return new_complementary_data
 
@@ -476,7 +479,7 @@ class InterventionActionProcessorStep(ProcessorStep):
         # Get intervention signals from complementary data
         info = transition.get(TransitionKey.INFO, {})
         complementary_data = transition.get(TransitionKey.COMPLEMENTARY_DATA, {})
-        teleop_action = complementary_data.get(TELEOP_ACTION_KEY, {})
+        teleop_action = complementary_data.get(TELEOP_ACTION_KEY)
         is_intervention = info.get(TeleopEvents.IS_INTERVENTION, False)
         terminate_episode = info.get(TeleopEvents.TERMINATE_EPISODE, False)
         success = info.get(TeleopEvents.SUCCESS, False)
@@ -484,7 +487,22 @@ class InterventionActionProcessorStep(ProcessorStep):
 
         new_transition = transition.copy()
 
-        # Override action if intervention is active
+        # Override action if intervention is active. If the teleop action cannot be read, fall back
+        # to holding the current pose (derived from the raw joint positions injected into the
+        # transition observation by the control loop).
+        action_source = "policy"
+        if is_intervention:
+            if teleop_action is None:
+                obs = transition.get(TransitionKey.OBSERVATION, {})
+                if isinstance(obs, dict):
+                    hold_action = {
+                        k: v for k, v in obs.items() if isinstance(k, str) and k.endswith(".pos")
+                    }
+                    teleop_action = hold_action if hold_action else None
+                action_source = "hold" if teleop_action is not None else "none"
+            else:
+                action_source = "teleop"
+
         if is_intervention and teleop_action is not None:
             teleop_action_tensor: torch.Tensor
             if isinstance(teleop_action, torch.Tensor):
@@ -547,6 +565,8 @@ class InterventionActionProcessorStep(ProcessorStep):
 
         # Update info with intervention metadata
         info = new_transition.get(TransitionKey.INFO, {})
+        if isinstance(info, dict):
+            info["_intervention_action_source"] = action_source
         info[TeleopEvents.IS_INTERVENTION] = is_intervention
         info[TeleopEvents.RERECORD_EPISODE] = rerecord_episode
         info[TeleopEvents.SUCCESS] = success

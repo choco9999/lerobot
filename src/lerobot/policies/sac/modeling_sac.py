@@ -15,7 +15,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import math
+import threading
+from collections import deque
 from collections.abc import Callable
 from dataclasses import asdict
 from typing import Literal
@@ -1088,6 +1091,8 @@ class _ACTGaussianActor(nn.Module):
         action_min: list[float] | None = None,
         action_max: list[float] | None = None,
         act_action_norm_mode: NormalizationMode | None = None,
+        prefetch_action_queue: bool = False,
+        prefetch_min_queue_len: int = 10,
     ) -> None:
         super().__init__()
         self.act_policy = act_policy
@@ -1096,6 +1101,14 @@ class _ACTGaussianActor(nn.Module):
         self.preprocessor = preprocessor
         self.postprocessor = postprocessor
         self.act_action_norm_mode = act_action_norm_mode
+        self._prefetch_action_queue = bool(prefetch_action_queue)
+        self._prefetch_min_queue_len = max(0, int(prefetch_min_queue_len))
+
+        self._prefetch_generation: int = 0
+        self._prefetch_thread: threading.Thread | None = None
+        self._prefetch_lock = threading.Lock()
+        self._act_queue_lock = threading.Lock()
+        self._act_forward_lock = threading.Lock()
 
         if (action_min is None) != (action_max is None):
             raise ValueError("action_min and action_max must be provided together (or both be None).")
@@ -1136,6 +1149,171 @@ class _ACTGaussianActor(nn.Module):
         reset_fn = getattr(self.act_policy, "reset", None)
         if callable(reset_fn):
             reset_fn()
+        with self._prefetch_lock:
+            self._prefetch_generation += 1
+            self._prefetch_thread = None
+        self._ensure_act_action_queue_capacity()
+
+    def _get_act_action_queue(self) -> deque | None:
+        q = getattr(self.act_policy, "_action_queue", None)
+        if isinstance(q, deque):
+            return q
+        return None
+
+    def _act_n_action_steps(self) -> int:
+        cfg = getattr(self.act_policy, "config", None)
+        n_action_steps = getattr(cfg, "n_action_steps", None)
+        try:
+            n_action_steps_int = int(n_action_steps)
+        except Exception:
+            n_action_steps_int = 0
+        return max(0, n_action_steps_int)
+
+    def _ensure_act_action_queue_capacity(self) -> None:
+        if not self._prefetch_action_queue:
+            return
+        q = self._get_act_action_queue()
+        if q is None:
+            return
+        n_action_steps = self._act_n_action_steps()
+        if n_action_steps <= 0:
+            return
+        desired = n_action_steps * 2
+        if q.maxlen is not None and q.maxlen >= desired:
+            return
+        setattr(self.act_policy, "_action_queue", deque(q, maxlen=desired))
+
+    def _prefetch_inflight(self) -> bool:
+        t = self._prefetch_thread
+        return t is not None and t.is_alive()
+
+    def _maybe_start_prefetch(self, observations: dict[str, Tensor]) -> None:
+        if not self._prefetch_action_queue or self._prefetch_min_queue_len <= 0:
+            return
+        if not isinstance(observations, dict) or not observations:
+            return
+        if self._prefetch_inflight():
+            return
+
+        with self._prefetch_lock:
+            if self._prefetch_thread is not None and self._prefetch_thread.is_alive():
+                return
+            generation = self._prefetch_generation
+            obs_snapshot = dict(observations)
+            t = threading.Thread(
+                target=self._prefetch_worker,
+                args=(obs_snapshot, generation),
+                daemon=True,
+            )
+            self._prefetch_thread = t
+            t.start()
+
+    def _prefetch_worker(self, observations: dict[str, Tensor], generation: int) -> None:
+        try:
+            actions_cpu = self._compute_prior_action_chunk(observations)
+        except Exception:  # noqa: BLE001
+            logging.getLogger(__name__).exception("ACT prefetch failed; continuing without prefetch.")
+            return
+
+        with self._prefetch_lock:
+            if generation != self._prefetch_generation:
+                return
+
+        q = self._get_act_action_queue()
+        if q is None:
+            return
+
+        with self._act_queue_lock:
+            if generation != self._prefetch_generation:
+                return
+            q.extend(actions_cpu.transpose(0, 1))
+
+    def _prepare_act_inputs(self, observations: dict[str, Tensor]) -> dict[str, Tensor]:
+        device = get_device_from_parameters(self.act_policy)
+        prepared: dict[str, Tensor] = {}
+        for key, value in observations.items():
+            if not isinstance(value, Tensor):
+                prepared[key] = value
+                continue
+
+            is_image = False
+            if isinstance(key, str):
+                is_image = (
+                    key in self.act_image_features
+                    or key == OBS_IMAGE
+                    or key.startswith(f"{OBS_IMAGES}.")
+                    or key.startswith(f"{OBS_IMAGE}.")
+                )
+
+            if is_image:
+                if value.dtype == torch.uint8:
+                    value = value.to(device=device, dtype=torch.float32, non_blocking=True).div_(255.0)
+                else:
+                    value = value.to(device=device, dtype=torch.float32, non_blocking=True)
+            elif value.is_floating_point():
+                value = value.to(device=device, dtype=torch.float32, non_blocking=True)
+            else:
+                value = value.to(device=device, non_blocking=True)
+
+            prepared[key] = value
+        return prepared
+
+    def _compute_prior_action_chunk(self, observations: dict[str, Tensor]) -> Tensor:
+        """Compute an ACT action chunk mapped into SAC's normalized [-1, 1] space (CPU tensor)."""
+        batch = self._prepare_act_inputs(observations)
+        batch = self._act_batch(batch)
+
+        act_model = getattr(self.act_policy, "model", None)
+        if not isinstance(act_model, nn.Module):
+            raise TypeError("ACT policy is missing a `.model` nn.Module.")
+
+        with self._act_forward_lock:
+            actions_seq, _ = act_model(batch)
+
+        if hasattr(self.act_policy, "_last_action_chunk"):
+            try:
+                setattr(self.act_policy, "_last_action_chunk", actions_seq)
+                prev_id = getattr(self.act_policy, "_last_action_chunk_id", 0)
+                setattr(self.act_policy, "_last_action_chunk_id", int(prev_id) + 1)
+            except Exception:
+                pass
+
+        if actions_seq.ndim != 3:
+            raise ValueError(f"Expected ACT to return (B, S, D) actions, got shape {tuple(actions_seq.shape)}")
+
+        n_action_steps = self._act_n_action_steps()
+        if n_action_steps <= 0:
+            n_action_steps = actions_seq.shape[1]
+        n_action_steps = min(n_action_steps, actions_seq.shape[1])
+
+        actions = actions_seq[:, :n_action_steps]
+
+        if self.postprocessor is not None:
+            b, s, d = actions.shape
+            flat = actions.reshape(b * s, d)
+            flat = self._postprocess_action(flat)
+            flat = self._minmax_normalize_action(flat)
+            actions = flat.reshape(b, s, d)
+
+        return actions.clamp(min=-1.0, max=1.0).detach().to("cpu")
+
+    def _hold_action_from_state(self, observations: dict[str, Tensor]) -> Tensor:
+        state = observations.get(OBS_STATE)
+        if not isinstance(state, Tensor):
+            raise KeyError("Missing observation.state; cannot compute hold action.")
+        if state.ndim == 1:
+            state = state.unsqueeze(0)
+        state = state.to(dtype=torch.float32, device="cpu")
+
+        if self._action_min is None or self._action_max is None:
+            # Best-effort: keep still in normalized space (may not correspond to hold for absolute targets).
+            return torch.zeros_like(state, dtype=torch.float32, device="cpu")
+
+        action_min = self._action_min.to(device=state.device, dtype=state.dtype)
+        action_max = self._action_max.to(device=state.device, dtype=state.dtype)
+        denom = (action_max - action_min).clamp(min=1e-6)
+        hold = 2.0 * (state - action_min) / denom - 1.0
+        return hold.clamp(min=-1.0, max=1.0)
 
     def _act_batch(self, observations: dict[str, Tensor]) -> dict[str, Tensor]:
         batch: dict[str, Tensor] = observations
@@ -1219,19 +1397,59 @@ class _ACTGaussianActor(nn.Module):
 
     def prior_action(self, observations: dict[str, Tensor], *, use_action_queue: bool) -> Tensor:
         """Compute the ACT-based prior action in SAC's normalized [-1, 1] action space."""
-        act_action: Tensor
-        if (
-            use_action_queue
-            and getattr(getattr(self.act_policy, "config", None), "temporal_ensemble_coeff", None) is None
-            and hasattr(self.act_policy, "_action_queue")
-            and len(getattr(self.act_policy, "_action_queue")) > 0
-        ):
-            # Fast path: when the ACT queue is non-empty, the next action is returned without
-            # using the current observation, so we can skip expensive preprocessing.
-            act_action = self._predict_act_action({}, use_action_queue=True)
-        else:
-            batch = self._act_batch(observations)
-            act_action = self._predict_act_action(batch, use_action_queue=use_action_queue)
+        temporal_coeff = getattr(getattr(self.act_policy, "config", None), "temporal_ensemble_coeff", None)
+        q = self._get_act_action_queue() if use_action_queue and temporal_coeff is None else None
+
+        # Queue-based ACT inference path. We store ACT actions already mapped into SAC's normalized
+        # [-1, 1] space so that per-step control stays on CPU and avoids periodic GPU stalls.
+        if use_action_queue and q is not None:
+            self._ensure_act_action_queue_capacity()
+
+            act_action: Tensor | None = None
+            remaining = 0
+            with self._act_queue_lock:
+                if len(q) > 0:
+                    act_action = q.popleft()
+                    remaining = len(q)
+
+            if act_action is None:
+                # If a background prefetch is in flight, keep the robot stable by commanding a
+                # "hold current joint positions" action in normalized space.
+                if self._prefetch_inflight():
+                    try:
+                        return self._hold_action_from_state(observations)
+                    except Exception:
+                        pass
+
+                try:
+                    actions_cpu = self._compute_prior_action_chunk(observations)
+                    with self._act_queue_lock:
+                        q.extend(actions_cpu.transpose(0, 1))
+                        if len(q) > 0:
+                            act_action = q.popleft()
+                            remaining = len(q)
+                except Exception:  # noqa: BLE001
+                    logging.getLogger(__name__).exception(
+                        "ACT action-queue refill failed; falling back to hold action."
+                    )
+                    try:
+                        return self._hold_action_from_state(observations)
+                    except Exception:
+                        batch = 1
+                        state = observations.get(OBS_STATE)
+                        if isinstance(state, Tensor) and state.ndim >= 1:
+                            batch = int(state.shape[0]) if state.ndim > 1 else 1
+                        return torch.zeros((batch, self.log_std.shape[0]), dtype=torch.float32)
+
+            if remaining <= self._prefetch_min_queue_len:
+                self._maybe_start_prefetch(observations)
+
+            return act_action.clamp(min=-1.0, max=1.0)
+
+        # Fallback: single-step ACT inference (may be expensive, but used for training and/or
+        # when ACT temporal ensembling is enabled).
+        batch = self._act_batch(observations)
+        act_action = self._predict_act_action(batch, use_action_queue=use_action_queue)
 
         # If a postprocessor exists, it typically unnormalizes ACT actions into "env action" units.
         # Map back into SAC's normalized [-1, 1] space using the configured min/max bounds.
@@ -1387,6 +1605,8 @@ class SACActPolicy(SACPolicy):
             action_min=action_min,
             action_max=action_max,
             act_action_norm_mode=act_action_norm_mode,
+            prefetch_action_queue=getattr(cfg, "act_prefetch_action_queue", False),
+            prefetch_min_queue_len=getattr(cfg, "act_prefetch_min_queue_len", 10),
         )
 
         # Keep SAC target entropy logic.

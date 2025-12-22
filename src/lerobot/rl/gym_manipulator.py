@@ -250,7 +250,9 @@ class RobotEnv(gym.Env):
         self.episode_data = None
         obs = self._get_observation()
         self._raw_joint_positions = {f"{key}.pos": obs[f"{key}.pos"] for key in self._joint_names}
-        return obs, {TeleopEvents.IS_INTERVENTION: False}
+        # Teleop/intervention events are injected by the action-processor pipeline; avoid
+        # returning placeholder TeleopEvents here as it can overwrite the true state downstream.
+        return obs, {}
 
     def step(self, action) -> tuple[dict[str, np.ndarray], float, bool, bool, dict[str, Any]]:
         """Execute one environment step with given action."""
@@ -276,7 +278,8 @@ class RobotEnv(gym.Env):
             reward,
             terminated,
             truncated,
-            {TeleopEvents.IS_INTERVENTION: False},
+            # Teleop/intervention events are handled by the action-processor pipeline.
+            {},
         )
 
     def render(self) -> None:
@@ -362,6 +365,7 @@ def make_processors(
     *,
     action_min: list[float] | None = None,
     action_max: list[float] | None = None,
+    keep_images_as_uint8: bool = False,
 ) -> tuple[
     DataProcessorPipeline[EnvTransition, EnvTransition], DataProcessorPipeline[EnvTransition, EnvTransition]
 ]:
@@ -388,7 +392,7 @@ def make_processors(
 
         env_pipeline_steps = [
             Numpy2TorchActionProcessorStep(),
-            VanillaObservationProcessorStep(),
+            VanillaObservationProcessorStep(keep_images_as_uint8=keep_images_as_uint8),
             AddBatchDimensionProcessorStep(),
             DeviceProcessorStep(device=device),
         ]
@@ -412,7 +416,7 @@ def make_processors(
             joint_names=motor_names,
         )
 
-    env_pipeline_steps = [VanillaObservationProcessorStep()]
+    env_pipeline_steps = [VanillaObservationProcessorStep(keep_images_as_uint8=keep_images_as_uint8)]
 
     if cfg.processor.observation is not None:
         if cfg.processor.observation.add_joint_velocity_to_observation:
@@ -545,22 +549,35 @@ def step_env_and_process_transition(
         Processed transition with updated state.
     """
 
+    t0 = time.perf_counter()
+
     # Create action transition
     transition[TransitionKey.ACTION] = action
     transition[TransitionKey.OBSERVATION] = (
         env.get_raw_joint_positions() if hasattr(env, "get_raw_joint_positions") else {}
     )
     processed_action_transition = action_processor(transition)
+    t1 = time.perf_counter()
     processed_action = processed_action_transition[TransitionKey.ACTION]
 
     obs, reward, terminated, truncated, info = env.step(processed_action)
+    t2 = time.perf_counter()
 
     reward = reward + processed_action_transition[TransitionKey.REWARD]
     terminated = terminated or processed_action_transition[TransitionKey.DONE]
     truncated = truncated or processed_action_transition[TransitionKey.TRUNCATED]
     complementary_data = processed_action_transition[TransitionKey.COMPLEMENTARY_DATA].copy()
     new_info = processed_action_transition[TransitionKey.INFO].copy()
-    new_info.update(info)
+    # Merge env-provided info without clobbering action-processor metadata such as teleop events.
+    # Action-processor values take precedence on key collisions.
+    if isinstance(info, dict):
+        new_info = dict(info)
+        new_info.update(processed_action_transition[TransitionKey.INFO].copy())
+
+    # Attach timing breakdown (milliseconds) for debugging control-loop jitter.
+    # These are NOT sent to the learner (we only stream state/action/reward/done/truncated).
+    new_info["_timing_action_processor_ms"] = (t1 - t0) * 1e3
+    new_info["_timing_env_step_ms"] = (t2 - t1) * 1e3
 
     new_transition = create_transition(
         observation=obs,
@@ -572,6 +589,9 @@ def step_env_and_process_transition(
         complementary_data=complementary_data,
     )
     new_transition = env_processor(new_transition)
+    t3 = time.perf_counter()
+    new_transition[TransitionKey.INFO]["_timing_env_processor_ms"] = (t3 - t2) * 1e3
+    new_transition[TransitionKey.INFO]["_timing_total_ms"] = (t3 - t0) * 1e3
 
     return new_transition
 

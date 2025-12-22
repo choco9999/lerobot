@@ -23,6 +23,8 @@
         "act_use_postprocessor": true,
         "act_deterministic_inference": true,
         "act_use_action_queue": true,
+        "act_prefetch_action_queue": true,
+        "act_prefetch_min_queue_len": 30,
         "act_log_action_chunk": true,
         "act_action_index": 0,
         "act_init_std": 0.2,
@@ -174,7 +176,7 @@
         },
         "robot": {
             "type": "so101_follower",
-            "port": "/dev/ttyACM1",
+            "port": "/dev/ttyACM0",
             "id": "my_awesome_follower_arm",
             "max_relative_target": 10.0,
             "cameras": {
@@ -196,7 +198,7 @@
         },
         "teleop": {
             "type": "so101_leader",
-            "port": "/dev/ttyACM0",
+            "port": "/dev/ttyACM1",
             "id": "my_awesome_leader_arm"
         }
     }
