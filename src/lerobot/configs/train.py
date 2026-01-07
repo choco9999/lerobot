@@ -252,12 +252,13 @@ class TrainRLServerPipelineConfig(TrainPipelineConfig):
             else:
                 self.job_name = f"{self.env.type}_{self.policy.type}"
 
-        if not self.resume and isinstance(self.output_dir, Path) and self.output_dir.is_dir():
-            raise FileExistsError(
-                f"Output directory {self.output_dir} already exists and resume is {self.resume}. "
-                f"Please change your output directory so that {self.output_dir} is not overwritten."
-            )
-        elif not self.output_dir:
+        # NOTE: Unlike offline training, RL uses multiple processes (learner + actor) that may be
+        # started independently and should be able to share the same `output_dir`. We therefore do
+        # not error when `output_dir` already exists for `resume=False`.
+        #
+        # Safety for resuming/overwriting an existing checkpointed run is handled by the learner in
+        # `lerobot.rl.learner.handle_resume_logic` (via `output_dir/checkpoints/last`).
+        if not self.output_dir:
             if self.resume:
                 inferred = _infer_latest_run_dir(job_name=str(self.job_name))
                 if inferred is None:

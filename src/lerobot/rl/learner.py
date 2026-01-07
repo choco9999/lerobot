@@ -336,16 +336,15 @@ def add_actor_information_and_train(
     log_training_info(cfg=cfg, policy=policy)
 
     replay_buffer = initialize_replay_buffer(cfg, device, storage_device)
-    batch_size = cfg.batch_size
-    offline_replay_buffer = None
-
-    if cfg.dataset is not None:
-        offline_replay_buffer = initialize_offline_replay_buffer(
-            cfg=cfg,
-            device=device,
-            storage_device=storage_device,
-        )
-        batch_size: int = batch_size // 2  # We will sample from both replay buffer
+    offline_replay_buffer = initialize_offline_replay_buffer(
+        cfg=cfg,
+        device=device,
+        storage_device=storage_device,
+    )
+    # HIL-SERL uses 50/50 sampling between the online buffer and a "human" buffer
+    # (offline demos + online human interventions).
+    online_batch_size = max(1, cfg.batch_size // 2)
+    offline_batch_size = max(1, cfg.batch_size - online_batch_size)
 
     logging.info("Starting learner thread")
     interaction_message = None
@@ -358,7 +357,8 @@ def add_actor_information_and_train(
 
     # Initialize iterators
     online_iterator = None
-    offline_iterator = None
+    prev_intervention = False
+    warned_missing_human_batch = False
 
     # NOTE: THIS IS THE MAIN LOOP OF THE LEARNER
     while True:
@@ -368,12 +368,12 @@ def add_actor_information_and_train(
             break
 
         # Process all available transitions to the replay buffer, send by the actor server
-        process_transitions(
+        prev_intervention = process_transitions(
             transition_queue=transition_queue,
             replay_buffer=replay_buffer,
             offline_replay_buffer=offline_replay_buffer,
             device=device,
-            dataset_repo_id=dataset_repo_id,
+            prev_intervention=prev_intervention,
             shutdown_event=shutdown_event,
         )
 
@@ -391,24 +391,41 @@ def add_actor_information_and_train(
 
         if online_iterator is None:
             online_iterator = replay_buffer.get_iterator(
-                batch_size=batch_size, async_prefetch=async_prefetch, queue_size=2
+                batch_size=online_batch_size, async_prefetch=async_prefetch, queue_size=2
             )
 
-        if offline_replay_buffer is not None and offline_iterator is None:
-            offline_iterator = offline_replay_buffer.get_iterator(
-                batch_size=batch_size, async_prefetch=async_prefetch, queue_size=2
-            )
+        def _sample_hilserl_batch() -> dict:
+            nonlocal warned_missing_human_batch
+            batch = next(online_iterator)
+            try:
+                batch_human = offline_replay_buffer.sample_by_complementary_key(
+                    TeleopEvents.IS_INTERVENTION.value,
+                    batch_size=offline_batch_size,
+                    threshold=0.5,
+                    fallback_to_random=False,
+                )
+                return concatenate_batch_transitions(
+                    left_batch_transitions=batch, right_batch_transition=batch_human
+                )
+            except Exception as exc:
+                if not warned_missing_human_batch:
+                    logging.info(
+                        "[LEARNER] Human buffer not ready (%s); training on online-only batches for now.",
+                        exc,
+                    )
+                    warned_missing_human_batch = True
+                batch_human = (
+                    next(online_iterator)
+                    if offline_batch_size == online_batch_size
+                    else replay_buffer.sample(offline_batch_size)
+                )
+                return concatenate_batch_transitions(
+                    left_batch_transitions=batch, right_batch_transition=batch_human
+                )
 
         time_for_one_optimization_step = time.time()
         for _ in range(utd_ratio - 1):
-            # Sample from the iterators
-            batch = next(online_iterator)
-
-            if dataset_repo_id is not None:
-                batch_offline = next(offline_iterator)
-                batch = concatenate_batch_transitions(
-                    left_batch_transitions=batch, right_batch_transition=batch_offline
-                )
+            batch = _sample_hilserl_batch()
 
             actions = batch[ACTION]
             rewards = batch["reward"]
@@ -460,13 +477,7 @@ def add_actor_information_and_train(
             policy.update_target_networks()
 
         # Sample for the last update in the UTD ratio
-        batch = next(online_iterator)
-
-        if dataset_repo_id is not None:
-            batch_offline = next(offline_iterator)
-            batch = concatenate_batch_transitions(
-                left_batch_transitions=batch, right_batch_transition=batch_offline
-            )
+        batch = _sample_hilserl_batch()
 
         actions = batch[ACTION]
         rewards = batch["reward"]
@@ -612,6 +623,35 @@ def add_actor_information_and_train(
                 fps=fps,
             )
 
+    # If we are stopping (Ctrl-C / shutdown), try to save a final checkpoint so the user can resume
+    # or inspect the latest weights even if `save_freq` was not reached.
+    if saving_checkpoint and replay_buffer is not None and len(replay_buffer) > 0:
+        has_existing_checkpoint = os.path.exists(
+            os.path.join(cfg.output_dir, CHECKPOINTS_DIR, LAST_CHECKPOINT_LINK)
+        )
+        if (not has_existing_checkpoint) or (
+            optimization_step % save_freq != 0 and optimization_step != online_steps
+        ):
+            try:
+                logging.info(
+                    "[LEARNER] Saving final checkpoint on shutdown at optimization_step=%s",
+                    optimization_step,
+                )
+                save_training_checkpoint(
+                    cfg=cfg,
+                    optimization_step=optimization_step,
+                    online_steps=online_steps,
+                    interaction_message=interaction_message,
+                    policy=policy,
+                    optimizers=optimizers,
+                    replay_buffer=replay_buffer,
+                    offline_replay_buffer=offline_replay_buffer,
+                    dataset_repo_id=dataset_repo_id,
+                    fps=fps,
+                )
+            except Exception:
+                logging.exception("[LEARNER] Failed to save final checkpoint on shutdown.")
+
 
 def start_learner(
     parameters_queue: Queue,
@@ -753,16 +793,16 @@ def save_training_checkpoint(
     # Save dataset
     # NOTE: Handle the case where the dataset repo id is not specified in the config
     # eg. RL training without demonstrations data
-    repo_id_buffer_save = cfg.env.task if dataset_repo_id is None else dataset_repo_id
+    repo_id_buffer_save = dataset_repo_id or cfg.env.task or str(cfg.job_name) or "hilserl_buffer"
     replay_buffer.to_lerobot_dataset(repo_id=repo_id_buffer_save, fps=fps, root=dataset_dir)
 
-    if offline_replay_buffer is not None:
+    if offline_replay_buffer is not None and len(offline_replay_buffer) > 0:
         dataset_offline_dir = os.path.join(cfg.output_dir, "dataset_offline")
         if os.path.exists(dataset_offline_dir) and os.path.isdir(dataset_offline_dir):
             shutil.rmtree(dataset_offline_dir)
 
         offline_replay_buffer.to_lerobot_dataset(
-            cfg.dataset.repo_id,
+            dataset_repo_id or repo_id_buffer_save,
             fps=fps,
             root=dataset_offline_dir,
         )
@@ -998,7 +1038,11 @@ def initialize_offline_replay_buffer(
     storage_device: str,
 ) -> ReplayBuffer:
     """
-    Initialize an offline replay buffer from a dataset.
+    Initialize the HIL-SERL "human" replay buffer.
+
+    This buffer is used to over-sample human-provided data during training:
+    - offline demonstrations (if `cfg.dataset` is provided)
+    - online human interventions (streamed from the actor)
 
     Args:
         cfg (TrainRLServerPipelineConfig): Training configuration
@@ -1008,6 +1052,16 @@ def initialize_offline_replay_buffer(
     Returns:
         ReplayBuffer: Initialized offline replay buffer
     """
+    if cfg.dataset is None:
+        logging.info("No offline dataset configured; initializing empty human replay buffer.")
+        return ReplayBuffer(
+            capacity=cfg.policy.offline_buffer_capacity,
+            device=device,
+            state_keys=cfg.policy.input_features.keys(),
+            storage_device=storage_device,
+            optimize_memory=True,
+        )
+
     if not cfg.resume:
         logging.info("make_dataset offline buffer")
         offline_dataset = make_dataset(cfg)
@@ -1020,15 +1074,16 @@ def initialize_offline_replay_buffer(
         )
 
     logging.info("Convert to a offline replay buffer")
-    offline_replay_buffer = ReplayBuffer.from_lerobot_dataset(
-        offline_dataset,
+    capacity = max(cfg.policy.offline_buffer_capacity, len(offline_dataset))
+    return ReplayBuffer.from_lerobot_dataset(
+        lerobot_dataset=offline_dataset,
         device=device,
         state_keys=cfg.policy.input_features.keys(),
         storage_device=storage_device,
         optimize_memory=True,
-        capacity=cfg.policy.offline_buffer_capacity,
+        capacity=capacity,
+        extra_complementary_info={TeleopEvents.IS_INTERVENTION.value: torch.tensor([1.0])},
     )
-    return offline_replay_buffer
 
 
 # Utilities/Helpers functions
@@ -1146,21 +1201,31 @@ def process_interaction_message(
 def process_transitions(
     transition_queue: Queue,
     replay_buffer: ReplayBuffer,
-    offline_replay_buffer: ReplayBuffer,
+    offline_replay_buffer: ReplayBuffer | None,
     device: str,
-    dataset_repo_id: str | None,
+    prev_intervention: bool,
     shutdown_event: any,
-):
+) -> bool:
     """Process all available transitions from the queue.
 
     Args:
         transition_queue: Queue for receiving transitions from the actor
         replay_buffer: Replay buffer to add transitions to
-        offline_replay_buffer: Offline replay buffer to add transitions to
+        offline_replay_buffer: Offline (human) replay buffer to add transitions to
         device: Device to move transitions to
-        dataset_repo_id: Repository ID for dataset
+        prev_intervention: Whether the previous transition was an intervention (state carried across calls)
         shutdown_event: Event to signal shutdown
+
+    Returns:
+        bool: Updated `prev_intervention` flag for the next call.
     """
+    def _as_bool(value: object) -> bool:
+        if isinstance(value, torch.Tensor):
+            if value.numel() != 1:
+                return False
+            return bool(value.item())
+        return bool(value)
+
     while not transition_queue.empty() and not shutdown_event.is_set():
         transition_list = transition_queue.get()
         transition_list = bytes_to_transitions(buffer=transition_list)
@@ -1183,14 +1248,28 @@ def process_transitions(
 
             replay_buffer.add(**transition)
 
-            # Add to offline buffer if it's an intervention
-            complementary_info = transition.get("complementary_info") or {}
-            is_intervention = complementary_info.get(TeleopEvents.IS_INTERVENTION)
-            if is_intervention is None:
-                is_intervention = complementary_info.get(TeleopEvents.IS_INTERVENTION.value)
+            # HIL-SERL "human buffer" logic:
+            # - Insert intervention transitions.
+            # - Also insert the first non-intervention transition right after an intervention segment,
+            #   so the last intervention transition has a correct next_state when using optimize_memory=True.
+            if offline_replay_buffer is not None:
+                complementary_info = transition.get("complementary_info") or {}
+                is_intervention = complementary_info.get(TeleopEvents.IS_INTERVENTION)
+                if is_intervention is None:
+                    is_intervention = complementary_info.get(TeleopEvents.IS_INTERVENTION.value)
+                is_intervention_b = _as_bool(is_intervention)
 
-            if dataset_repo_id is not None and is_intervention:
-                offline_replay_buffer.add(**transition)
+                if is_intervention_b:
+                    offline_replay_buffer.add(**transition)
+                    prev_intervention = True
+                elif prev_intervention:
+                    offline_replay_buffer.add(**transition)
+                    prev_intervention = False
+
+                if _as_bool(transition.get("done", False)) or _as_bool(transition.get("truncated", False)):
+                    prev_intervention = False
+
+    return prev_intervention
 
 
 def process_interaction_messages(

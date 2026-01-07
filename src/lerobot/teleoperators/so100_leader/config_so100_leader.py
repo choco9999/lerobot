@@ -24,3 +24,15 @@ from ..config import TeleoperatorConfig
 class SO100LeaderConfig(TeleoperatorConfig):
     # Port to connect to the arm
     port: str
+
+    # If True, automatically enable intervention when the leader arm is moved.
+    auto_intervention: bool = True
+
+    # Trigger intervention when max(|Δjoint|) exceeds this threshold (in leader joint units).
+    auto_intervention_threshold: float = 1.0
+
+    # Keep intervention active for this many seconds after the last detected motion.
+    auto_intervention_hold_s: float = 0.5
+
+    # Whether gripper motion should trigger auto intervention.
+    auto_intervention_include_gripper: bool = False

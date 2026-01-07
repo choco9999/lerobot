@@ -1,9 +1,7 @@
 [前準備]
 cd lerobot
-source venv/bin/activate
-sudo chmod 777 -R /dev
-
 conda activate lerobot
+sudo chmod 777 -R /dev
 
 [動かすだけ]
 sudo rm -R /home/tmc/.cache/huggingface/lerobot/chocolat-nya/eval_record_tag_test
@@ -34,24 +32,24 @@ python -m src.lerobot.scripts.lerobot_calibrate \
 
 
 [学習]
-sudo rm -R /home/kazu/.cache/huggingface/lerobot/chocolat-nya/record_test100_tahara_c2
+sudo rm -R /home/kazu/.cache/huggingface/lerobot/chocolat-nya/record_greentag_teho_20251224
 
 python -m src.lerobot.scripts.lerobot_record \
   --robot.discover_packages_path=lerobot.robots.so101_follower \
   --robot.cameras.discover_packages_path=lerobot.cameras.opencv \
   --robot.type=so101_follower \
-  --robot.port=/dev/ttyACM0 \
+  --robot.port=/dev/ttyACM1 \
   --robot.id=my_awesome_follower_arm \
-  --robot.cameras='{"front": {"type": "opencv", "index_or_path": 2, "width": 640, "height": 480, "fps": 30}, "back": {"type": "opencv", "index_or_path": 4, "width": 640, "height": 480, "fps": 15}}' \
+  --robot.cameras='{"front": {"type": "opencv", "index_or_path": 2, "width": 640, "height": 480, "fps": 15}, "back": {"type": "opencv", "index_or_path": 5, "width": 640, "height": 480, "fps": 30}}' \
   --teleop.discover_packages_path=lerobot.teleoperators.so101_leader \
   --teleop.type=so101_leader \
-  --teleop.port=/dev/ttyACM1 \
+  --teleop.port=/dev/ttyACM0 \
   --teleop.id=my_awesome_leader_arm \
-  --dataset.repo_id=chocolat-nya/record_test100_tahara_c2 \
+  --dataset.repo_id=chocolat-nya/record_greentag_teho_20251224 \
   --dataset.single_task="Grab the black cube" \
   --dataset.episode_time_s=15 \
-  --dataset.reset_time_s=5 \
-  --dataset.num_episodes=10 \
+  --dataset.reset_time_s=0 \
+  --dataset.num_episodes=1 \
   --display_data=false \
   --resume=true
 
@@ -59,18 +57,18 @@ python -m src.lerobot.scripts.lerobot_record \
 
 
 [推論]
-sudo rm -R /home/kazu/.cache/huggingface/lerobot/chocolat-nya/eval_record_test100_tahara_c
+sudo rm -R /home/kazu/.cache/huggingface/lerobot/chocolat-nya/eval_record_greentag_teho_20251224
 
 python -m src.lerobot.scripts.lerobot_record  \
     --robot.type=so101_follower \
     --robot.port=/dev/ttyACM1 \
     --robot.id=my_awesome_follower_arm \
-    --robot.cameras="{ front: {type: opencv, index_or_path: 2, width: 640, height: 480, fps: 30}, back: {type: opencv, index_or_path: 4, width: 640, height: 480, fps: 30}}" \
+    --robot.cameras="{ front: {type: opencv, index_or_path: 2, width: 640, height: 480, fps: 15}, back: {type: opencv, index_or_path: 4, width: 640, height: 480, fps: 30}}" \
     --display_data=false \
-    --dataset.repo_id=chocolat-nya/eval_record_test100_tahara_c \
+    --dataset.repo_id=chocolat-nya/eval_record_greentag_teho_20251224 \
     --dataset.single_task="Grab the black cube" \
     --policy.device=mps \
-    --policy.path=chocolat-nya/record_test100_tahara_c
+    --policy.path=chocolat-nya/record_greentag_teho_20251224
 
 
 [強化学習(HIL-SERL)]

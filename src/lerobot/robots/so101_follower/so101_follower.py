@@ -148,15 +148,57 @@ class SO101Follower(Robot):
         print("Calibration saved to", self.calibration_fpath)
 
     def configure(self) -> None:
+        def _override_u8(default: int, overrides: dict[str, int] | None, *, motor: str, name: str) -> int:
+            if overrides is None or motor not in overrides:
+                return default
+            value = overrides[motor]
+            if not isinstance(value, int):
+                raise TypeError(f"{name} for motor '{motor}' must be an int, got {type(value).__name__}")
+            if not 0 <= value <= 255:
+                raise ValueError(f"{name} for motor '{motor}' must be in [0, 255], got {value}")
+            return value
+
+        known_motors = set(self.bus.motors)
+        for name, overrides in [
+            ("p_coefficients", self.config.p_coefficients),
+            ("i_coefficients", self.config.i_coefficients),
+            ("d_coefficients", self.config.d_coefficients),
+            ("accelerations", self.config.accelerations),
+        ]:
+            if overrides:
+                unknown = sorted(set(overrides) - known_motors)
+                if unknown:
+                    logger.warning("Ignoring unknown motors in robot.%s: %s", name, unknown)
+
         with self.bus.torque_disabled():
             self.bus.configure_motors()
             for motor in self.bus.motors:
                 self.bus.write("Operating_Mode", motor, OperatingMode.POSITION.value)
-                # Set P_Coefficient to lower value to avoid shakiness (Default is 32)
-                self.bus.write("P_Coefficient", motor, 16)
-                # Set I_Coefficient and D_Coefficient to default value 0 and 32
-                self.bus.write("I_Coefficient", motor, 0)
-                self.bus.write("D_Coefficient", motor, 32)
+                # P_Coefficient controls stiffness (default is 32). Too low can prevent the arm from
+                # moving against gravity or overcoming stiction, making it look like "it barely moves".
+                # If the arm is shaky, override per-motor via `robot.p_coefficients`.
+                p_default = 16 if motor == "gripper" else 32
+                self.bus.write(
+                    "P_Coefficient",
+                    motor,
+                    _override_u8(p_default, self.config.p_coefficients, motor=motor, name="p_coefficients"),
+                )
+                self.bus.write(
+                    "I_Coefficient",
+                    motor,
+                    _override_u8(0, self.config.i_coefficients, motor=motor, name="i_coefficients"),
+                )
+                self.bus.write(
+                    "D_Coefficient",
+                    motor,
+                    _override_u8(32, self.config.d_coefficients, motor=motor, name="d_coefficients"),
+                )
+                if self.config.accelerations is not None and motor in self.config.accelerations:
+                    self.bus.write(
+                        "Acceleration",
+                        motor,
+                        _override_u8(254, self.config.accelerations, motor=motor, name="accelerations"),
+                    )
 
                 if motor == "gripper":
                     self.bus.write(
@@ -208,7 +250,10 @@ class SO101Follower(Robot):
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
-        goal_pos = {key.removesuffix(".pos"): val for key, val in action.items() if key.endswith(".pos")}
+        # Ensure downstream motor bus/safety code receives plain Python scalars.
+        goal_pos = {
+            key.removesuffix(".pos"): float(val) for key, val in action.items() if key.endswith(".pos")
+        }
 
         # Cap goal position when too far away from present position.
         # /!\ Slower fps expected due to reading from the follower.

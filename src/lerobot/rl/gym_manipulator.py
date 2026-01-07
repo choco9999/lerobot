@@ -42,6 +42,7 @@ from lerobot.processor import (
     JointVelocityProcessorStep,
     MapDeltaActionToRobotActionStep,
     MapTensorToDeltaActionDictStep,
+    MaxRelativeTargetActionProcessorStep,
     MinMaxUnnormalizeActionProcessorStep,
     MotorCurrentProcessorStep,
     Numpy2TorchActionProcessorStep,
@@ -256,7 +257,11 @@ class RobotEnv(gym.Env):
 
     def step(self, action) -> tuple[dict[str, np.ndarray], float, bool, bool, dict[str, Any]]:
         """Execute one environment step with given action."""
-        joint_targets_dict = {f"{key}.pos": action[i] for i, key in enumerate(self.robot.bus.motors.keys())}
+        # Ensure we pass plain Python scalars to the robot driver. Torch/NumPy scalars can
+        # trigger subtle type/compare issues in downstream safety clamps and motor buses.
+        joint_targets_dict = {
+            f"{key}.pos": float(action[i]) for i, key in enumerate(self.robot.bus.motors.keys())
+        }
 
         self.robot.send_action(joint_targets_dict)
 
@@ -406,6 +411,9 @@ def make_processors(
     # Full processor pipeline for real robot environment
     # Get robot and motor information for kinematics
     motor_names = list(env.robot.bus.motors.keys())
+    max_relative_target = None
+    if cfg.robot is not None:
+        max_relative_target = getattr(cfg.robot, "max_relative_target", None)
 
     # Set up kinematics solver if inverse kinematics is configured
     kinematics_solver = None
@@ -520,6 +528,15 @@ def make_processors(
         action_pipeline_steps.append(
             MinMaxUnnormalizeActionProcessorStep(action_min=action_min, action_max=action_max)
         )
+        if max_relative_target is not None:
+            action_pipeline_steps.append(
+                MaxRelativeTargetActionProcessorStep(
+                    motor_names=motor_names,
+                    max_relative_target=max_relative_target,
+                    action_min=action_min,
+                    action_max=action_max,
+                )
+            )
 
     return DataProcessorPipeline(
         steps=env_pipeline_steps, to_transition=identity_transition, to_output=identity_transition

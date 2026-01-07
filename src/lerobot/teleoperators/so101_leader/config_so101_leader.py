@@ -26,3 +26,17 @@ class SO101LeaderConfig(TeleoperatorConfig):
     port: str
 
     use_degrees: bool = False
+
+    # If True, automatically enable intervention when the leader arm is moved.
+    # This matches upstream HIL-SERL spacemouse wrappers (movement implies intervention),
+    # and avoids relying on pynput/keyboard focus.
+    auto_intervention: bool = True
+
+    # Trigger intervention when max(|Δjoint|) exceeds this threshold (in leader joint units).
+    auto_intervention_threshold: float = 1.0
+
+    # Keep intervention active for this many seconds after the last detected motion.
+    auto_intervention_hold_s: float = 0.5
+
+    # Whether gripper motion should trigger auto intervention.
+    auto_intervention_include_gripper: bool = False

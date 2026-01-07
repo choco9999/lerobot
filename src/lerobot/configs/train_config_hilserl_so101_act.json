@@ -4,12 +4,12 @@
     "resume": false,
     "seed": 1000,
     "num_workers": 2,
-    "batch_size": 256,
+    "batch_size": 32,
     "steps": 100000,
     "eval_freq": 20000,
-    "log_freq": 500,
+    "log_freq": 100,
     "save_checkpoint": true,
-    "save_freq": 5000,
+    "save_freq": 500,
     "wandb": {
         "enable": false,
         "project": "so101_hilserl",
@@ -27,7 +27,7 @@
         "act_prefetch_min_queue_len": 30,
         "act_log_action_chunk": true,
         "act_action_index": 0,
-        "act_init_std": 0.2,
+        "act_init_std": 0.05,
         "push_to_hub": false,
         "n_obs_steps": 1,
         "normalization_mapping": {
@@ -176,7 +176,7 @@
         },
         "robot": {
             "type": "so101_follower",
-            "port": "/dev/ttyACM0",
+            "port": "/dev/ttyACM1",
             "id": "my_awesome_follower_arm",
             "max_relative_target": 10.0,
             "cameras": {
@@ -189,7 +189,7 @@
                 },
                 "back": {
                     "type": "opencv",
-                    "index_or_path": 4,
+                    "index_or_path": 5,
                     "height": 480,
                     "width": 640,
                     "fps": 10
@@ -198,7 +198,7 @@
         },
         "teleop": {
             "type": "so101_leader",
-            "port": "/dev/ttyACM1",
+            "port": "/dev/ttyACM0",
             "id": "my_awesome_leader_arm"
         }
     }

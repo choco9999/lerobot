@@ -86,7 +86,7 @@ from lerobot.utils.transition import (
     move_state_dict_to_device,
     move_transition_to_device,
 )
-from lerobot.utils.constants import OBS_IMAGE
+from lerobot.utils.constants import OBS_IMAGE, OBS_STATE
 from lerobot.utils.utils import (
     TimerManager,
     get_safe_torch_device,
@@ -341,6 +341,10 @@ def act_with_policy(
         policy_timer = TimerManager("Policy inference", log=False)
         last_policy_ms: float | None = None
         last_act_queue_len: int | None = None
+        last_telemetry_log_s = time.monotonic()
+        telemetry_interval_s = 1.0
+        telemetry_prev_state_t: torch.Tensor | None = None
+        telemetry_prev_robot_action_t: torch.Tensor | None = None
         action_dim = None
         if cfg.policy is not None:
             try:
@@ -352,6 +356,48 @@ def act_with_policy(
         if action_dim is None:
             raise ValueError("Could not infer action dimension from policy config.")
         neutral_action = torch.zeros(action_dim, dtype=torch.float32)
+        action_min_t = (
+            torch.tensor(action_min, dtype=torch.float32, device="cpu")
+            if action_min is not None and action_max is not None
+            else None
+        )
+        action_max_t = (
+            torch.tensor(action_max, dtype=torch.float32, device="cpu")
+            if action_min is not None and action_max is not None
+            else None
+        )
+
+        def _hold_action_from_current_state() -> torch.Tensor:
+            """Return a safe 'do nothing' action in policy (normalized) space.
+
+            - For joint-space absolute control (no IK) with known action bounds, this maps the current
+              `observation.state` back into SAC's [-1, 1] action space so that unnormalization yields
+              a true hold-position command.
+            - Otherwise, falls back to zeros (appropriate for delta-action control).
+            """
+            if action_min_t is None or action_max_t is None:
+                return neutral_action
+            if cfg.env.processor.inverse_kinematics is not None:
+                return neutral_action
+
+            obs = transition.get(TransitionKey.OBSERVATION, {})
+            if not isinstance(obs, dict):
+                return neutral_action
+            state = obs.get(OBS_STATE)
+            if not isinstance(state, torch.Tensor):
+                return neutral_action
+
+            state_t = state
+            if state_t.ndim == 1:
+                state_t = state_t.unsqueeze(0)
+            state_t = state_t.to(device="cpu", dtype=torch.float32)
+
+            if state_t.shape[-1] != action_min_t.numel():
+                return neutral_action
+
+            denom = (action_max_t - action_min_t).clamp(min=1e-6)
+            hold = 2.0 * (state_t - action_min_t) / denom - 1.0
+            return hold.clamp(min=-1.0, max=1.0).squeeze(0)
 
         def _can_skip_observation_for_action_queue(policy: SACPolicy) -> bool:
             cfg_obj = getattr(policy, "config", None)
@@ -409,7 +455,11 @@ def act_with_policy(
 
             policy_fps: float | None = None
             if is_prev_intervention:
-                action = neutral_action
+                # Keep the robot stable even if the user just toggled intervention OFF.
+                # There is a 1-step lag between reading teleop events (in the action processor) and
+                # this loop's `is_prev_intervention` flag, so using a literal zero action here can
+                # command an unintended absolute joint target.
+                action = _hold_action_from_current_state()
             else:
                 # Time policy inference and check if it meets FPS requirement
                 with policy_timer:
@@ -480,6 +530,7 @@ def act_with_policy(
             # Teleop action is the action that was executed in the environment
             # It is either the action from the teleop device or the action from the policy
             executed_action = new_transition[TransitionKey.COMPLEMENTARY_DATA]["teleop_action"]
+            executed_robot_action = new_transition.get(TransitionKey.ACTION)
 
             reward = new_transition[TransitionKey.REWARD]
             done = new_transition.get(TransitionKey.DONE, False)
@@ -537,6 +588,98 @@ def act_with_policy(
                 except Exception:
                     logging.exception("[ACTOR] Failed to reset policy on intervention toggle.")
                 last_intervention_state = current_intervention_state
+
+            # Lightweight telemetry to debug "robot hardly moves" reports.
+            now_s = time.monotonic()
+            interval_s = now_s - last_telemetry_log_s
+            if interval_s >= telemetry_interval_s:
+                last_telemetry_log_s = now_s
+                info = new_transition.get(TransitionKey.INFO, {})
+                action_source = None
+                is_intervention = current_intervention_state
+                if isinstance(info, dict):
+                    action_source = info.get("_intervention_action_source")
+
+                state = new_transition.get(TransitionKey.OBSERVATION, {}).get(OBS_STATE)
+                robot_action = executed_robot_action
+                policy_action = executed_action
+
+                def _as_1d(t: torch.Tensor | None) -> torch.Tensor | None:
+                    if not isinstance(t, torch.Tensor):
+                        return None
+                    if t.ndim > 1 and t.shape[0] == 1:
+                        t = t.squeeze(0)
+                    return t.detach().to("cpu", dtype=torch.float32)
+
+                state_t = _as_1d(state if isinstance(state, torch.Tensor) else None)
+                robot_action_t = _as_1d(robot_action if isinstance(robot_action, torch.Tensor) else None)
+                policy_action_t = _as_1d(policy_action if isinstance(policy_action, torch.Tensor) else None)
+
+                delta_max = None
+                if state_t is not None and robot_action_t is not None and state_t.shape == robot_action_t.shape:
+                    delta_max = float((robot_action_t - state_t).abs().max().item())
+
+                move_max = None
+                if (
+                    telemetry_prev_state_t is not None
+                    and state_t is not None
+                    and telemetry_prev_state_t.shape == state_t.shape
+                ):
+                    move_max = float((state_t - telemetry_prev_state_t).abs().max().item())
+                telemetry_prev_state_t = state_t
+
+                cmd_change_max = None
+                if (
+                    telemetry_prev_robot_action_t is not None
+                    and robot_action_t is not None
+                    and telemetry_prev_robot_action_t.shape == robot_action_t.shape
+                ):
+                    cmd_change_max = float((robot_action_t - telemetry_prev_robot_action_t).abs().max().item())
+                telemetry_prev_robot_action_t = robot_action_t
+
+                def _max_abs(t: torch.Tensor | None) -> float | None:
+                    if t is None:
+                        return None
+                    return float(t.abs().max().item())
+
+                def _fmt_vec(t: torch.Tensor | None, *, decimals: int = 1) -> str:
+                    if t is None:
+                        return "n/a"
+                    vals = t.tolist()
+                    if not isinstance(vals, list):
+                        vals = [vals]
+                    fmt = f"{{:.{decimals}f}}"
+                    return "[" + ", ".join(fmt.format(float(v)) for v in vals) + "]"
+
+                clamp_flag = None
+                clamp_desired = None
+                clamp_applied = None
+                clamp_amount = None
+                if isinstance(info, dict):
+                    clamp_flag = info.get("_max_relative_target_clamped")
+                    clamp_desired = info.get("_max_relative_target_desired_delta_max")
+                    clamp_applied = info.get("_max_relative_target_applied_delta_max")
+                    clamp_amount = info.get("_max_relative_target_clamp_amount_max")
+
+                logging.info(
+                    "[ACTOR] step=%d mode=%s src=%s |a|_norm=%s |a|_robot=%s |Δ|=%s move=%s cmdΔ=%s clamp=%s/%s/%s/%s state=%s cmd=%s act_q=%s policy_ms=%s",
+                    interaction_step,
+                    "HIL" if is_intervention else "POLICY",
+                    action_source if action_source is not None else "n/a",
+                    f"{_max_abs(policy_action_t):.3f}" if policy_action_t is not None else "n/a",
+                    f"{_max_abs(robot_action_t):.1f}" if robot_action_t is not None else "n/a",
+                    f"{delta_max:.1f}" if delta_max is not None else "n/a",
+                    f"{move_max:.1f}" if move_max is not None else "n/a",
+                    f"{cmd_change_max:.1f}" if cmd_change_max is not None else "n/a",
+                    "Y" if clamp_flag else "N" if clamp_flag is not None else "n/a",
+                    f"{float(clamp_desired):.1f}" if clamp_desired is not None else "n/a",
+                    f"{float(clamp_applied):.1f}" if clamp_applied is not None else "n/a",
+                    f"{float(clamp_amount):.1f}" if clamp_amount is not None else "n/a",
+                    _fmt_vec(state_t, decimals=1),
+                    _fmt_vec(robot_action_t, decimals=1),
+                    last_act_queue_len if last_act_queue_len is not None else "n/a",
+                    f"{last_policy_ms:.0f}" if last_policy_ms is not None else "n/a",
+                )
 
             # Flush transitions frequently to avoid building huge in-memory buffers which can get the
             # process killed by the OOM killer when serializing large episodes with images.

@@ -767,3 +767,134 @@ class MinMaxUnnormalizeActionProcessorStep(ProcessorStep):
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
     ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
         return features
+
+
+@dataclass
+@ProcessorStepRegistry.register("max_relative_target_action_processor")
+class MaxRelativeTargetActionProcessorStep(ProcessorStep):
+    """Clamp absolute joint-target actions to be at most `max_relative_target` away from the present position.
+
+    This mirrors the safety clamp historically implemented inside robot drivers (e.g. SO101Follower),
+    but does it inside the action-processor pipeline so:
+      - the environment receives the same (clamped) command that we record for RL, and
+      - the robot driver becomes a pure IO layer (it can still keep its own clamp as a last resort).
+
+    Assumes `TransitionKey.ACTION` is already in *robot joint units* (i.e. after min/max unnormalization)
+    and that `TransitionKey.OBSERVATION` contains raw joint positions keyed by "{motor}.pos".
+    """
+
+    motor_names: list[str]
+    max_relative_target: float | dict[str, float] | None = None
+    action_min: list[float] | None = None
+    action_max: list[float] | None = None
+
+    def __post_init__(self) -> None:
+        if self.max_relative_target is None:
+            return
+        if isinstance(self.max_relative_target, dict):
+            motors = set(self.motor_names)
+            keys = set(self.max_relative_target)
+            unknown = sorted(keys - motors)
+            missing = sorted(motors - keys)
+            if unknown:
+                raise ValueError(
+                    "max_relative_target has unknown motors "
+                    f"{unknown}; expected keys={sorted(motors)}"
+                )
+            if missing:
+                raise ValueError(
+                    "max_relative_target is missing motors "
+                    f"{missing}; expected keys={sorted(motors)}"
+                )
+
+    def __call__(self, transition: EnvTransition) -> EnvTransition:
+        self._current_transition = transition.copy()
+        new_transition = self._current_transition
+
+        if self.max_relative_target is None:
+            return new_transition
+
+        action = new_transition.get(TransitionKey.ACTION)
+        if not isinstance(action, torch.Tensor):
+            return new_transition
+        action = _squeeze_batch_dim_if_present(action)
+        if action.ndim != 1:
+            action = action.reshape(-1)
+
+        obs = new_transition.get(TransitionKey.OBSERVATION, {})
+        if not isinstance(obs, dict):
+            return new_transition
+
+        present_vals: list[float] = []
+        for motor in self.motor_names:
+            key = f"{motor}.pos"
+            if key not in obs:
+                return new_transition
+            val = obs[key]
+            if isinstance(val, torch.Tensor):
+                if val.numel() != 1:
+                    return new_transition
+                present_vals.append(float(val.item()))
+            else:
+                present_vals.append(float(val))
+
+        present = torch.tensor(present_vals, dtype=action.dtype, device=action.device)
+        if action.numel() != present.numel():
+            return new_transition
+
+        info = new_transition.get(TransitionKey.INFO, {})
+        if not isinstance(info, dict):
+            info = {}
+        else:
+            info = dict(info)
+
+        if isinstance(self.max_relative_target, float):
+            max_diff = torch.full_like(action, float(self.max_relative_target))
+        else:
+            max_diff_vals = [float(self.max_relative_target[m]) for m in self.motor_names]
+            max_diff = torch.tensor(max_diff_vals, dtype=action.dtype, device=action.device)
+
+        diff = action - present
+        safe_diff = torch.minimum(diff, max_diff)
+        safe_diff = torch.maximum(safe_diff, -max_diff)
+        clamped_action = present + safe_diff
+
+        desired_delta_max = float(diff.abs().max().item())
+        applied_delta_max = float(safe_diff.abs().max().item())
+        clamp_amount_max = float((action - clamped_action).abs().max().item())
+
+        info["_max_relative_target_enabled"] = True
+        info["_max_relative_target_desired_delta_max"] = desired_delta_max
+        info["_max_relative_target_applied_delta_max"] = applied_delta_max
+        info["_max_relative_target_clamp_amount_max"] = clamp_amount_max
+
+        if torch.equal(clamped_action, action):
+            info["_max_relative_target_clamped"] = False
+            new_transition[TransitionKey.INFO] = info
+            return new_transition
+
+        info["_max_relative_target_clamped"] = True
+        new_transition[TransitionKey.INFO] = info
+        new_transition[TransitionKey.ACTION] = clamped_action
+
+        # Keep the action stored for RL aligned with the actual executed action.
+        if self.action_min is not None and self.action_max is not None:
+            try:
+                action_min = torch.tensor(self.action_min, dtype=clamped_action.dtype, device=clamped_action.device)
+                action_max = torch.tensor(self.action_max, dtype=clamped_action.dtype, device=clamped_action.device)
+                if clamped_action.numel() == action_min.numel():
+                    clamped_norm = _minmax_normalize(clamped_action, action_min, action_max).clamp(-1.0, 1.0)
+                    complementary_data = new_transition.get(TransitionKey.COMPLEMENTARY_DATA) or {}
+                    if not isinstance(complementary_data, dict):
+                        complementary_data = {}
+                    complementary_data[TELEOP_ACTION_KEY] = clamped_norm
+                    new_transition[TransitionKey.COMPLEMENTARY_DATA] = complementary_data
+            except Exception:  # noqa: BLE001
+                logger.debug("Failed to update teleop_action after max_relative_target clamp.", exc_info=True)
+
+        return new_transition
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        return features

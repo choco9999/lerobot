@@ -39,3 +39,10 @@ class SO101FollowerConfig(RobotConfig):
 
     # Set to `True` for backward compatibility with previous policies/dataset
     use_degrees: bool = False
+
+    # Optional per-motor tuning (raw register values).
+    # These are applied in `SO101Follower.configure()`.
+    p_coefficients: dict[str, int] | None = None
+    i_coefficients: dict[str, int] | None = None
+    d_coefficients: dict[str, int] | None = None
+    accelerations: dict[str, int] | None = None

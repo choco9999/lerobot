@@ -142,11 +142,11 @@ def teleop_loop(
     while True:
         loop_start = time.perf_counter()
 
-        # Get robot observation
-        # Not really needed for now other than for visualization
-        # teleop_action_processor can take None as an observation
-        # given that it is the identity processor as default
-        obs = robot.get_observation()
+        obs: RobotObservation | None = None
+        if display_data:
+            # Only fetch robot observations when needed for visualization.
+            # This prevents the control loop from stalling on slow/failed reads.
+            obs = robot.get_observation()
 
         # Get teleop action
         raw_action = teleop.get_action()
@@ -160,7 +160,7 @@ def teleop_loop(
         # Send processed action to robot (robot_action_processor.to_output should return dict[str, Any])
         _ = robot.send_action(robot_action_to_send)
 
-        if display_data:
+        if display_data and obs is not None:
             # Process robot observation through pipeline
             obs_transition = robot_observation_processor(obs)
 
