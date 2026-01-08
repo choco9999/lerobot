@@ -148,6 +148,10 @@ class SACConfig(PreTrainedConfig):
     async_prefetch: bool = False
     # Number of steps before learning starts
     online_step_before_learning: int = 100
+    # Minimum number of transitions with reward > 0 required before starting actor/temperature updates.
+    # This is useful for sparse-reward HIL settings to avoid catastrophic drift when only failures
+    # (reward==0) have been observed so far.
+    min_positive_reward_transitions_before_actor_update: int = 0
     # Frequency of policy updates
     policy_update_freq: int = 1
 

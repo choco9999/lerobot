@@ -822,7 +822,7 @@ def act_with_policy(
                             timing,
                         )
                         setattr(act_with_policy, "_last_slow_step_log_s", now_s)
-                precise_sleep(1 / cfg.env.fps - dt_time)
+                precise_sleep(max(1 / cfg.env.fps - dt_time, 0.0))
     finally:
         if action_chunk_log_f is not None:
             try:

@@ -9,6 +9,7 @@
     "eval_freq": 20000,
     "log_freq": 500,
     "save_checkpoint": true,
+    "save_replay_buffer_dataset": false,
     "save_freq": 50000,
     "wandb": {
         "enable": false,

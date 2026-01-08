@@ -71,6 +71,10 @@ Learner は以下の2種類のリプレイバッファを使い、原則 **50/50
 ## 出力
 
 - 学習結果・ログは `outputs/train/...` 配下に出ます（実行時刻と `job_name` でフォルダが作られます）。
+- **チェックポイント（ckpt）保存は learner 側のみ**です。`outputs/train/.../checkpoints/last/` を確認してください。
+  - `output_dir` を `null` のまま起動すると、learner/actor で別フォルダが作られて混乱しやすいので、必要なら両方に同じ `output_dir` を指定してください（例: `--output_dir outputs/train/my_run`）。
+  - `save_freq` は **optimization step** 単位です（環境ステップではありません）。早めに ckpt が欲しい場合は `save_freq` を小さくしてください。
+  - `save_replay_buffer_dataset=true` にするとリプレイバッファを `<output_dir>/dataset` に書き出しますが、実機（画像あり）だと重くなりがちなので通常は `false` 推奨です。
 
 ## 注意（ACTとの関係）
 

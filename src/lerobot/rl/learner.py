@@ -51,6 +51,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from pprint import pformat
+from queue import Empty as QueueEmpty
+from queue import Full as QueueFull
 
 import grpc
 import torch
@@ -194,13 +196,16 @@ def start_learner_threads(
     if use_threads(cfg):
         import queue as _queue
 
-        transition_queue = _queue.Queue()
-        interaction_message_queue = _queue.Queue()
-        parameters_queue = _queue.Queue()
+        # Keep these bounded: the actor can produce very large transition messages (images). When the learner
+        # stalls (e.g. during checkpointing) an unbounded queue can quickly eat RAM and destabilize control.
+        transition_queue = _queue.Queue(maxsize=8)
+        interaction_message_queue = _queue.Queue(maxsize=256)
+        # Only the most recent parameters matter; keep this tiny and drop old ones on push.
+        parameters_queue = _queue.Queue(maxsize=1)
     else:
-        transition_queue = Queue()
-        interaction_message_queue = Queue()
-        parameters_queue = Queue()
+        transition_queue = Queue(maxsize=8)
+        interaction_message_queue = Queue(maxsize=256)
+        parameters_queue = Queue(maxsize=1)
 
     concurrency_entity = None
 
@@ -517,6 +522,11 @@ def add_actor_information_and_train(
             "loss_critic": loss_critic.item(),
             "critic_grad_norm": critic_grad_norm,
         }
+        try:
+            training_infos["batch_reward_mean"] = float(rewards.mean().item())
+            training_infos["batch_reward_max"] = float(rewards.max().item())
+        except Exception:
+            pass
 
         # Discrete critic optimization (if available)
         if policy.config.num_discrete_actions is not None:
@@ -534,7 +544,20 @@ def add_actor_information_and_train(
             training_infos["discrete_critic_grad_norm"] = discrete_critic_grad_norm
 
         # Actor and temperature optimization (at specified frequency)
-        if optimization_step % policy_update_freq == 0:
+        actor_updates_allowed = True
+        min_positive = int(getattr(cfg.policy, "min_positive_reward_transitions_before_actor_update", 0) or 0)
+        positive_reward_transitions: int | None = None
+        if min_positive > 0:
+            try:
+                rewards_buf = replay_buffer.rewards[: len(replay_buffer)]
+                positive_reward_transitions = int((rewards_buf > 0).sum().item())
+                actor_updates_allowed = positive_reward_transitions >= min_positive
+            except Exception:
+                # Best-effort: if we fail to compute the gate, default to preserving existing behavior.
+                actor_updates_allowed = True
+                positive_reward_transitions = None
+
+        if actor_updates_allowed and optimization_step % policy_update_freq == 0:
             for _ in range(policy_update_freq):
                 # Actor optimization
                 actor_output = policy.forward(forward_batch, model="actor")
@@ -567,6 +590,11 @@ def add_actor_information_and_train(
 
                 # Update temperature
                 policy.update_temperature()
+        elif not actor_updates_allowed:
+            # Avoid drifting a pretrained actor when the reward signal is absent (common in sparse-reward HIL setups).
+            training_infos["actor_updates_skipped"] = 1
+            if positive_reward_transitions is not None:
+                training_infos["positive_reward_transitions"] = positive_reward_transitions
 
         # Push policy to actors if needed
         if time.time() - last_time_policy_pushed > policy_parameters_push_frequency:
@@ -586,6 +614,8 @@ def add_actor_information_and_train(
             # Log training metrics
             if wandb_logger:
                 wandb_logger.log_dict(d=training_infos, mode="train", custom_step_key="Optimization step")
+            else:
+                logging.info("[LEARNER] Training metrics: %s", training_infos)
 
         # Calculate and log optimization frequency
         time_for_one_optimization_step = time.time() - time_for_one_optimization_step
@@ -784,27 +814,33 @@ def save_training_checkpoint(
     # Update the "last" symlink
     update_last_checkpoint(checkpoint_dir)
 
-    # TODO : temporary save replay buffer here, remove later when on the robot
-    # We want to control this with the keyboard inputs
-    dataset_dir = os.path.join(cfg.output_dir, "dataset")
-    if os.path.exists(dataset_dir) and os.path.isdir(dataset_dir):
-        shutil.rmtree(dataset_dir)
+    # Optional: export replay buffers as LeRobot datasets.
+    # This is useful for debugging, but can be very slow on real robots (large images) and stall the
+    # learner for minutes, which may destabilize the control loop. Keep it opt-in.
+    if getattr(cfg, "save_replay_buffer_dataset", False):
+        dataset_dir = os.path.join(cfg.output_dir, "dataset")
+        if os.path.exists(dataset_dir) and os.path.isdir(dataset_dir):
+            shutil.rmtree(dataset_dir)
 
-    # Save dataset
-    # NOTE: Handle the case where the dataset repo id is not specified in the config
-    # eg. RL training without demonstrations data
-    repo_id_buffer_save = dataset_repo_id or cfg.env.task or str(cfg.job_name) or "hilserl_buffer"
-    replay_buffer.to_lerobot_dataset(repo_id=repo_id_buffer_save, fps=fps, root=dataset_dir)
+        # Save dataset
+        # NOTE: Handle the case where the dataset repo id is not specified in the config
+        # eg. RL training without demonstrations data
+        repo_id_buffer_save = dataset_repo_id or cfg.env.task or str(cfg.job_name) or "hilserl_buffer"
+        replay_buffer.to_lerobot_dataset(repo_id=repo_id_buffer_save, fps=fps, root=dataset_dir)
 
-    if offline_replay_buffer is not None and len(offline_replay_buffer) > 0:
-        dataset_offline_dir = os.path.join(cfg.output_dir, "dataset_offline")
-        if os.path.exists(dataset_offline_dir) and os.path.isdir(dataset_offline_dir):
-            shutil.rmtree(dataset_offline_dir)
+        if offline_replay_buffer is not None and len(offline_replay_buffer) > 0:
+            dataset_offline_dir = os.path.join(cfg.output_dir, "dataset_offline")
+            if os.path.exists(dataset_offline_dir) and os.path.isdir(dataset_offline_dir):
+                shutil.rmtree(dataset_offline_dir)
 
-        offline_replay_buffer.to_lerobot_dataset(
-            dataset_repo_id or repo_id_buffer_save,
-            fps=fps,
-            root=dataset_offline_dir,
+            offline_replay_buffer.to_lerobot_dataset(
+                dataset_repo_id or repo_id_buffer_save,
+                fps=fps,
+                root=dataset_offline_dir,
+            )
+    else:
+        logging.info(
+            "[LEARNER] Skipping replay buffer dataset export (save_replay_buffer_dataset=false)."
         )
 
     logging.info("Resume training")
@@ -1180,7 +1216,24 @@ def push_actor_policy_to_queue(parameters_queue: Queue, policy: nn.Module):
         logging.debug("[LEARNER] Including discrete critic in state dict push")
 
     state_bytes = state_to_bytes(state_dicts)
-    parameters_queue.put(state_bytes)
+    try:
+        parameters_queue.put(state_bytes, block=False)
+        return
+    except Exception:  # noqa: BLE001
+        # Queue is likely full; drop stale params and retry (best-effort).
+        try:
+            _ = parameters_queue.get_nowait()
+        except QueueEmpty:
+            pass
+        except Exception:  # noqa: BLE001
+            pass
+
+    try:
+        parameters_queue.put(state_bytes, block=False)
+    except QueueFull:
+        logging.debug("[LEARNER] Parameters queue full; dropping policy push.")
+    except Exception:  # noqa: BLE001
+        logging.exception("[LEARNER] Failed to push policy parameters to queue.")
 
 
 def process_interaction_message(

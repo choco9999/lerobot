@@ -84,6 +84,12 @@ python -m src.lerobot.scripts.lerobot_record  \
 # 3) actor を起動（別ターミナル）
 #   python -m src.lerobot.rl.actor --config_path src/lerobot/configs/train_config_hilserl_so101_act.json
 #
+# NOTE:
+# - ckpt（チェックポイント）は learner が `outputs/train/.../checkpoints/last/` に保存する（actor 側には作られない）
+# - `output_dir` が `null` だと learner/actor で別フォルダになりやすいので、必要なら両方に同じ `--output_dir=...` を指定する
+# - `save_freq` は optimization step 単位（環境ステップではない）。早く ckpt が欲しい場合は `save_freq` を下げる
+# - `save_replay_buffer_dataset=true` は `<output_dir>/dataset` へ書き出す（実機だと重くなりがちなので通常は false 推奨）
+#
 # 介入・ラベル操作（SO101 leader 使用時）
 #   space : 介入ON/OFF（トグル）
 #   s     : 成功（success）

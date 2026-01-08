@@ -9,6 +9,7 @@
     "eval_freq": 20000,
     "log_freq": 100,
     "save_checkpoint": true,
+    "save_replay_buffer_dataset": false,
     "save_freq": 500,
     "wandb": {
         "enable": false,
@@ -100,6 +101,7 @@
         "online_buffer_capacity": 5000,
         "offline_buffer_capacity": 5000,
         "online_step_before_learning": 1000,
+        "min_positive_reward_transitions_before_actor_update": 1,
         "policy_update_freq": 1,
         "discount": 0.99,
         "async_prefetch": false,
@@ -182,14 +184,14 @@
             "cameras": {
                 "front": {
                     "type": "opencv",
-                    "index_or_path": 2,
+                    "index_or_path": 4,
                     "height": 480,
                     "width": 640,
                     "fps": 30
                 },
                 "back": {
                     "type": "opencv",
-                    "index_or_path": 5,
+                    "index_or_path": 2,
                     "height": 480,
                     "width": 640,
                     "fps": 10

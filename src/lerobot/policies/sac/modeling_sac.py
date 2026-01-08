@@ -1584,15 +1584,15 @@ class SACActPolicy(SACPolicy):
         # If we apply an ACT postprocessor, we must map back to SAC's [-1, 1] space using min/max stats.
         action_min = None
         action_max = None
-        if postprocessor is not None:
-            action_stats = (cfg.dataset_stats or {}).get(ACTION, {})
-            if not isinstance(action_stats, dict) or "min" not in action_stats or "max" not in action_stats:
-                raise ValueError(
-                    "When using an ACT postprocessor, you must provide `policy.dataset_stats.action.min/max` "
-                    "so SAC-ACT can map ACT actions back into SAC's [-1, 1] space."
-                )
+        action_stats = (cfg.dataset_stats or {}).get(ACTION, {})
+        if isinstance(action_stats, dict) and "min" in action_stats and "max" in action_stats:
             action_min = action_stats["min"]
             action_max = action_stats["max"]
+        elif postprocessor is not None:
+            raise ValueError(
+                "When using an ACT postprocessor, you must provide `policy.dataset_stats.action.min/max` "
+                "so SAC-ACT can map ACT actions back into SAC's [-1, 1] space."
+            )
 
         self.actor = _ACTGaussianActor(
             act_policy=act_policy,
