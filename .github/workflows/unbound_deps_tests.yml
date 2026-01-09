@@ -91,6 +91,7 @@ jobs:
     name: Build and Push Docker
     runs-on:
       group: aws-general-8-plus
+    if: github.repository == 'huggingface/lerobot'
     outputs:
       image_tag: ${{ env.DOCKER_IMAGE_NAME }}
     env:
@@ -131,6 +132,7 @@ jobs:
     needs: [build-and-push-docker]
     runs-on:
       group: aws-g6-4xlarge-plus
+    if: github.repository == 'huggingface/lerobot'
     env:
       HF_HOME: /home/user_lerobot/.cache/huggingface
       HF_LEROBOT_HOME: /home/user_lerobot/.cache/huggingface/lerobot
@@ -157,7 +159,7 @@ jobs:
   delete-unbound-image:
     name: Delete Unbound Image
     needs: [gpu-tests, build-and-push-docker]
-    if: always() && needs.build-and-push-docker.result == 'success'
+    if: github.repository == 'huggingface/lerobot' && always() && needs.build-and-push-docker.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - name: Get Docker Hub Token and Delete Image

@@ -114,6 +114,7 @@ jobs:
     needs: [build-docker-cpu-nightly]
     runs-on:
       group: aws-g6-4xlarge-plus
+    if: github.repository == 'huggingface/lerobot'
     env:
       HF_HOME: /home/user_lerobot/.cache/huggingface
       HF_LEROBOT_HOME: /home/user_lerobot/.cache/huggingface/lerobot
@@ -141,6 +142,7 @@ jobs:
     needs: [build-docker-gpu-nightly]
     runs-on:
       group: aws-g6-4xlarge-plus
+    if: github.repository == 'huggingface/lerobot'
     env:
       HF_HOME: /home/user_lerobot/.cache/huggingface
       HF_LEROBOT_HOME: /home/user_lerobot/.cache/huggingface/lerobot
@@ -168,6 +170,7 @@ jobs:
     needs: [build-docker-gpu-nightly]
     runs-on:
       group: aws-g4dn-12xlarge  # Instance with 4 GPUs
+    if: github.repository == 'huggingface/lerobot'
     env:
       HF_HOME: /home/user_lerobot/.cache/huggingface
       HF_LEROBOT_HOME: /home/user_lerobot/.cache/huggingface/lerobot
