@@ -301,6 +301,26 @@ def act_with_policy(
             cfg=cfg.policy,
             env_cfg=cfg.env,
         )
+
+        # Keep SAC(-ACT) inference consistent with the real-robot action clamp by propagating
+        # `env.robot.max_relative_target` into the policy config (if not already set).
+        try:
+            env_robot = getattr(cfg.env, "robot", None)
+            env_max_relative_target = (
+                getattr(env_robot, "max_relative_target", None) if env_robot is not None else None
+            )
+            if (
+                env_max_relative_target is not None
+                and getattr(getattr(cfg.env, "processor", None), "inverse_kinematics", None) is None
+                and getattr(getattr(policy, "config", None), "max_relative_target", None) is None
+            ):
+                policy.config.max_relative_target = float(env_max_relative_target)
+                logging.info(
+                    "[ACTOR] policy.max_relative_target set from env.robot.max_relative_target=%s",
+                    policy.config.max_relative_target,
+                )
+        except Exception:
+            logging.debug("[ACTOR] Failed to propagate env.robot.max_relative_target into policy config.")
         policy = policy.eval()
         assert isinstance(policy, nn.Module)
 
@@ -693,8 +713,13 @@ def act_with_policy(
                 pending_transitions = []
 
             if done or truncated:
+                pre_label_episode_reward = float(sum_reward_episode)
                 logging.info(
-                    f"[ACTOR] Global step {interaction_step}: Episode reward: {sum_reward_episode}"
+                    "[ACTOR] Global step %d: Episode ended (done=%s truncated=%s). Pre-label episodic reward: %.6f",
+                    interaction_step,
+                    bool(done),
+                    bool(truncated),
+                    pre_label_episode_reward,
                 )
 
                 episode_success: bool | None = None
@@ -732,6 +757,21 @@ def act_with_policy(
                         terminal_transition["truncated"] = False
                         pending_transitions.append(terminal_transition)
                         sum_reward_episode += float(episode_success) - previous_reward
+
+                if episode_success is None:
+                    logging.info(
+                        "[ACTOR] Global step %d: Episodic reward (final): %.6f",
+                        interaction_step,
+                        float(sum_reward_episode),
+                    )
+                else:
+                    logging.info(
+                        "[ACTOR] Global step %d: Episode label=%d -> episodic reward (final): %.6f (was %.6f)",
+                        interaction_step,
+                        int(episode_success),
+                        float(sum_reward_episode),
+                        pre_label_episode_reward,
+                    )
 
                 update_policy_parameters(policy=policy, parameters_queue=parameters_queue, device=device)
 

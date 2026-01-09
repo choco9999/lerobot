@@ -119,6 +119,26 @@ class SACConfig(PreTrainedConfig):
         }
     )
 
+    # Optional environment-side safety constraint: maximum per-step delta (in robot joint units)
+    # between the commanded absolute target action and the current joint positions. When set,
+    # SAC will project sampled actions to this constraint during critic target computation and
+    # actor optimization, aligning learning with the action-processor clamp used on real robots.
+    #
+    # NOTE: This is only meaningful for joint-space *absolute target* control with known action
+    # bounds (`dataset_stats.action.min/max`) and an `observation.state` that contains raw joint
+    # positions in the same units.
+    max_relative_target: float | None = None
+
+    # Additional actor regularization weight to discourage violating `max_relative_target`.
+    # This penalizes the distance between the raw sampled action and the projected action in
+    # SAC's normalized [-1, 1] action space.
+    max_relative_target_violation_penalty: float = 0.0
+
+    # Optional behavior-cloning style regularization on human intervention / demo transitions.
+    # When > 0, the SAC actor loss adds an MSE term that nudges the *deterministic* policy action
+    # toward the dataset action for transitions whose `complementary_info['is_intervention']` is True.
+    intervention_bc_loss_weight: float = 0.0
+
     # Architecture specifics
     # Device to run the model on (e.g., "cuda", "cpu")
     device: str = "cpu"
@@ -144,6 +164,16 @@ class SACConfig(PreTrainedConfig):
     online_buffer_capacity: int = 100000
     # Capacity of the offline replay buffer
     offline_buffer_capacity: int = 100000
+    # Success-reward shaping for sparse-reward setups (e.g., prompt-based success labels).
+    # If > 0, when a terminal transition with reward>0 is observed, the learner will assign a small
+    # positive reward to the previous `success_reward_shaping_tail_steps` transitions in that episode.
+    # This helps learning signal propagate earlier without requiring a reward classifier.
+    success_reward_shaping_tail_steps: int = 0
+    # Per-step reward assigned during success-tail shaping. If None, defaults to (terminal_reward / tail_steps).
+    success_reward_shaping_tail_reward: float | None = None
+    # Optional replay buffer that stores recent "success tail" transitions so learning can continue even
+    # after the online buffer has been overwritten by failures. Set to 0 to disable.
+    success_replay_buffer_capacity: int = 0
     # Whether to use asynchronous prefetching for the buffers
     async_prefetch: bool = False
     # Number of steps before learning starts
@@ -243,6 +273,10 @@ class SACConfig(PreTrainedConfig):
     def action_delta_indices(self) -> list:
         return None  # SAC typically predicts one action at a time
 
+    @property
+    def reward_delta_indices(self) -> list | None:
+        return None
+
 
 @PreTrainedConfig.register_subclass("sac_act")
 @dataclass
@@ -288,6 +322,22 @@ class SACActConfig(SACConfig):
 
     # Initial standard deviation (in tanh-Gaussian base space) for the stochastic actor built on top of ACT.
     act_init_std: float = 0.2
+
+    # Scale factor applied to `policy.actor_lr` for the ACT backbone parameters.
+    # ACT models are typically much larger than the default MLP actor, so using a smaller LR helps
+    # avoid catastrophic drift in sparse-reward HIL settings.
+    act_finetune_lr_scale: float = 0.1
+
+    # If True, freeze the ACT policy backbone weights during RL and learn only auxiliary parameters
+    # (e.g. log_std or an optional residual policy head). This prevents catastrophic drift when the
+    # reward signal is sparse/noisy and the pretrained policy is already reasonably good.
+    act_freeze_backbone: bool = False
+
+    # Optional residual policy (in SAC-normalized [-1, 1] action space) added on top of the ACT prior.
+    # The residual is initialized to output zeros so inference starts identical to the pretrained ACT.
+    # A good default scale is around 0.05-0.15 (roughly 5-15 degrees when action range is [-100, 100]).
+    act_residual_scale: float = 0.0
+    act_residual_hidden_dims: list[int] = field(default_factory=lambda: [64, 64])
 
     # If True, the RL actor process logs ACT's predicted action chunks (shape: B x chunk_size x action_dim)
     # to a JSONL file under `<output_dir>/logs/`.

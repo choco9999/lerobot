@@ -327,6 +327,26 @@ def add_actor_information_and_train(
 
     assert isinstance(policy, nn.Module)
 
+    # Keep SAC(-ACT) training consistent with the real-robot action clamp by propagating
+    # `env.robot.max_relative_target` into the policy config (if not already set).
+    try:
+        env_robot = getattr(cfg.env, "robot", None)
+        env_max_relative_target = (
+            getattr(env_robot, "max_relative_target", None) if env_robot is not None else None
+        )
+        if (
+            env_max_relative_target is not None
+            and getattr(getattr(cfg.env, "processor", None), "inverse_kinematics", None) is None
+            and getattr(getattr(policy, "config", None), "max_relative_target", None) is None
+        ):
+            policy.config.max_relative_target = float(env_max_relative_target)
+            logging.info(
+                "[LEARNER] policy.max_relative_target set from env.robot.max_relative_target=%s",
+                policy.config.max_relative_target,
+            )
+    except Exception:
+        logging.debug("[LEARNER] Failed to propagate env.robot.max_relative_target into policy config.")
+
     policy.train()
 
     push_actor_policy_to_queue(parameters_queue=parameters_queue, policy=policy)
@@ -346,6 +366,30 @@ def add_actor_information_and_train(
         device=device,
         storage_device=storage_device,
     )
+    success_tail_steps = int(getattr(cfg.policy, "success_reward_shaping_tail_steps", 0) or 0)
+    success_tail_reward = getattr(cfg.policy, "success_reward_shaping_tail_reward", None)
+    success_buffer_capacity = int(getattr(cfg.policy, "success_replay_buffer_capacity", 0) or 0)
+    success_replay_buffer: ReplayBuffer | None = None
+    if success_tail_steps > 0 and success_buffer_capacity > 0:
+        success_replay_buffer = ReplayBuffer(
+            capacity=success_buffer_capacity,
+            device=device,
+            state_keys=cfg.policy.input_features.keys(),
+            storage_device=storage_device,
+            optimize_memory=True,
+        )
+        logging.info(
+            "[LEARNER] Success-tail shaping enabled (tail_steps=%s, tail_reward=%s) with success buffer capacity=%s.",
+            success_tail_steps,
+            success_tail_reward,
+            success_buffer_capacity,
+        )
+    elif success_tail_steps > 0:
+        logging.info(
+            "[LEARNER] Success-tail shaping enabled (tail_steps=%s, tail_reward=%s) without a success buffer.",
+            success_tail_steps,
+            success_tail_reward,
+        )
     # HIL-SERL uses 50/50 sampling between the online buffer and a "human" buffer
     # (offline demos + online human interventions).
     online_batch_size = max(1, cfg.batch_size // 2)
@@ -364,6 +408,8 @@ def add_actor_information_and_train(
     online_iterator = None
     prev_intervention = False
     warned_missing_human_batch = False
+    warned_missing_success_batch = False
+    logged_using_success_buffer = False
 
     # NOTE: THIS IS THE MAIN LOOP OF THE LEARNER
     while True:
@@ -377,9 +423,12 @@ def add_actor_information_and_train(
             transition_queue=transition_queue,
             replay_buffer=replay_buffer,
             offline_replay_buffer=offline_replay_buffer,
+            success_replay_buffer=success_replay_buffer,
             device=device,
             prev_intervention=prev_intervention,
             shutdown_event=shutdown_event,
+            success_tail_steps=success_tail_steps,
+            success_tail_reward=success_tail_reward,
         )
 
         # Process all available interaction messages sent by the actor server
@@ -400,7 +449,7 @@ def add_actor_information_and_train(
             )
 
         def _sample_hilserl_batch() -> dict:
-            nonlocal warned_missing_human_batch
+            nonlocal warned_missing_human_batch, warned_missing_success_batch, logged_using_success_buffer
             batch = next(online_iterator)
             try:
                 batch_human = offline_replay_buffer.sample_by_complementary_key(
@@ -419,14 +468,36 @@ def add_actor_information_and_train(
                         exc,
                     )
                     warned_missing_human_batch = True
-                batch_human = (
-                    next(online_iterator)
-                    if offline_batch_size == online_batch_size
-                    else replay_buffer.sample(offline_batch_size)
-                )
-                return concatenate_batch_transitions(
-                    left_batch_transitions=batch, right_batch_transition=batch_human
-                )
+
+            if success_replay_buffer is not None:
+                try:
+                    batch_success = success_replay_buffer.sample(offline_batch_size)
+                    if not logged_using_success_buffer:
+                        logging.info(
+                            "[LEARNER] Using success buffer for auxiliary batches (size=%s).",
+                            len(success_replay_buffer),
+                        )
+                        logged_using_success_buffer = True
+                    return concatenate_batch_transitions(
+                        left_batch_transitions=batch,
+                        right_batch_transition=batch_success,
+                    )
+                except Exception as exc:
+                    if not warned_missing_success_batch:
+                        logging.info(
+                            "[LEARNER] Success buffer not ready (%s); falling back to online-only batches.",
+                            exc,
+                        )
+                        warned_missing_success_batch = True
+
+            batch_human = (
+                next(online_iterator)
+                if offline_batch_size == online_batch_size
+                else replay_buffer.sample(offline_batch_size)
+            )
+            return concatenate_batch_transitions(
+                left_batch_transitions=batch, right_batch_transition=batch_human
+            )
 
         time_for_one_optimization_step = time.time()
         for _ in range(utd_ratio - 1):
@@ -505,6 +576,7 @@ def add_actor_information_and_train(
             "done": done,
             "observation_feature": observation_features,
             "next_observation_feature": next_observation_features,
+            "complementary_info": batch.get("complementary_info"),
         }
 
         critic_output = policy.forward(forward_batch, model="critic")
@@ -522,9 +594,13 @@ def add_actor_information_and_train(
             "loss_critic": loss_critic.item(),
             "critic_grad_norm": critic_grad_norm,
         }
+        batch_reward_mean: float | None = None
+        batch_reward_max: float | None = None
         try:
-            training_infos["batch_reward_mean"] = float(rewards.mean().item())
-            training_infos["batch_reward_max"] = float(rewards.max().item())
+            batch_reward_mean = float(rewards.mean().item())
+            batch_reward_max = float(rewards.max().item())
+            training_infos["batch_reward_mean"] = batch_reward_mean
+            training_infos["batch_reward_max"] = batch_reward_max
         except Exception:
             pass
 
@@ -547,54 +623,72 @@ def add_actor_information_and_train(
         actor_updates_allowed = True
         min_positive = int(getattr(cfg.policy, "min_positive_reward_transitions_before_actor_update", 0) or 0)
         positive_reward_transitions: int | None = None
+        skip_no_positive_in_batch = False
+        skip_insufficient_positive_transitions = False
         if min_positive > 0:
             try:
                 rewards_buf = replay_buffer.rewards[: len(replay_buffer)]
                 positive_reward_transitions = int((rewards_buf > 0).sum().item())
-                actor_updates_allowed = positive_reward_transitions >= min_positive
+                if success_replay_buffer is not None and len(success_replay_buffer) > 0:
+                    try:
+                        rewards_success = success_replay_buffer.rewards[: len(success_replay_buffer)]
+                        positive_reward_transitions += int((rewards_success > 0).sum().item())
+                    except Exception:
+                        pass
+                if positive_reward_transitions < min_positive:
+                    actor_updates_allowed = False
+                    skip_insufficient_positive_transitions = True
             except Exception:
                 # Best-effort: if we fail to compute the gate, default to preserving existing behavior.
                 actor_updates_allowed = True
                 positive_reward_transitions = None
+            # Extra safety for sparse-reward HIL: don't update the actor on batches that contain
+            # no positive rewards yet (critic is typically uninformative early on).
+            if batch_reward_max is not None and batch_reward_max <= 0.0:
+                actor_updates_allowed = False
+                skip_no_positive_in_batch = True
+            if positive_reward_transitions is not None:
+                training_infos["positive_reward_transitions"] = positive_reward_transitions
 
         if actor_updates_allowed and optimization_step % policy_update_freq == 0:
-            for _ in range(policy_update_freq):
-                # Actor optimization
-                actor_output = policy.forward(forward_batch, model="actor")
-                loss_actor = actor_output["loss_actor"]
-                optimizers["actor"].zero_grad()
-                loss_actor.backward()
-                actor_grad_norm = torch.nn.utils.clip_grad_norm_(
-                    parameters=policy.actor.parameters(), max_norm=clip_grad_norm_value
-                ).item()
-                optimizers["actor"].step()
+            # Actor optimization (optionally less frequent than critic updates).
+            actor_output = policy.forward(forward_batch, model="actor")
+            loss_actor = actor_output["loss_actor"]
+            optimizers["actor"].zero_grad()
+            loss_actor.backward()
+            actor_grad_norm = torch.nn.utils.clip_grad_norm_(
+                parameters=policy.actor.parameters(), max_norm=clip_grad_norm_value
+            ).item()
+            optimizers["actor"].step()
 
-                # Add actor info to training info
-                training_infos["loss_actor"] = loss_actor.item()
-                training_infos["actor_grad_norm"] = actor_grad_norm
+            # Add actor info to training info
+            training_infos["loss_actor"] = loss_actor.item()
+            training_infos["actor_grad_norm"] = actor_grad_norm
 
-                # Temperature optimization
-                temperature_output = policy.forward(forward_batch, model="temperature")
-                loss_temperature = temperature_output["loss_temperature"]
-                optimizers["temperature"].zero_grad()
-                loss_temperature.backward()
-                temp_grad_norm = torch.nn.utils.clip_grad_norm_(
-                    parameters=[policy.log_alpha], max_norm=clip_grad_norm_value
-                ).item()
-                optimizers["temperature"].step()
+            # Temperature optimization
+            temperature_output = policy.forward(forward_batch, model="temperature")
+            loss_temperature = temperature_output["loss_temperature"]
+            optimizers["temperature"].zero_grad()
+            loss_temperature.backward()
+            temp_grad_norm = torch.nn.utils.clip_grad_norm_(
+                parameters=[policy.log_alpha], max_norm=clip_grad_norm_value
+            ).item()
+            optimizers["temperature"].step()
 
-                # Add temperature info to training info
-                training_infos["loss_temperature"] = loss_temperature.item()
-                training_infos["temperature_grad_norm"] = temp_grad_norm
-                training_infos["temperature"] = policy.temperature
+            # Add temperature info to training info
+            training_infos["loss_temperature"] = loss_temperature.item()
+            training_infos["temperature_grad_norm"] = temp_grad_norm
+            training_infos["temperature"] = policy.temperature
 
-                # Update temperature
-                policy.update_temperature()
+            # Update temperature
+            policy.update_temperature()
         elif not actor_updates_allowed:
             # Avoid drifting a pretrained actor when the reward signal is absent (common in sparse-reward HIL setups).
             training_infos["actor_updates_skipped"] = 1
-            if positive_reward_transitions is not None:
-                training_infos["positive_reward_transitions"] = positive_reward_transitions
+            if skip_no_positive_in_batch:
+                training_infos["actor_updates_skipped_no_positive_in_batch"] = 1
+            if skip_insufficient_positive_transitions:
+                training_infos["actor_updates_skipped_insufficient_positive_reward_transitions"] = 1
 
         # Push policy to actors if needed
         if time.time() - last_time_policy_pushed > policy_parameters_push_frequency:
@@ -609,7 +703,32 @@ def add_actor_information_and_train(
             training_infos["replay_buffer_size"] = len(replay_buffer)
             if offline_replay_buffer is not None:
                 training_infos["offline_replay_buffer_size"] = len(offline_replay_buffer)
+            if success_replay_buffer is not None:
+                training_infos["success_replay_buffer_size"] = len(success_replay_buffer)
             training_infos["Optimization step"] = optimization_step
+            # Log max_relative_target constraint diagnostics (if enabled in the SAC config).
+            try:
+                stats_actor = getattr(policy, "_last_max_relative_target_stats_actor", None)
+                if isinstance(stats_actor, dict):
+                    for key, value in stats_actor.items():
+                        if isinstance(value, torch.Tensor) and value.numel() == 1:
+                            training_infos[f"actor_{key}"] = float(value.item())
+                stats_critic = getattr(policy, "_last_max_relative_target_stats_critic", None)
+                if isinstance(stats_critic, dict):
+                    for key, value in stats_critic.items():
+                        if isinstance(value, torch.Tensor) and value.numel() == 1:
+                            training_infos[f"critic_{key}"] = float(value.item())
+            except Exception:
+                pass
+            # Log SAC-ACT residual policy diagnostics (if enabled).
+            try:
+                residual_stats = getattr(policy, "_last_act_residual_stats", None)
+                if isinstance(residual_stats, dict):
+                    for key, value in residual_stats.items():
+                        if isinstance(value, torch.Tensor) and value.numel() == 1:
+                            training_infos[f"actor_{key}"] = float(value.item())
+            except Exception:
+                pass
 
             # Log training metrics
             if wandb_logger:
@@ -872,21 +991,34 @@ def make_optimizers_and_scheduler(cfg: TrainRLServerPipelineConfig, policy: nn.M
         - `lr_scheduler`: Currently set to `None` but can be extended to support learning rate scheduling.
 
     """
-    optimizer_actor = torch.optim.Adam(
-        params=[
-            p
-            for n, p in policy.actor.named_parameters()
-            if not policy.config.shared_encoder or not n.startswith("encoder")
-        ],
-        lr=cfg.policy.actor_lr,
-    )
+    actor_named_params = [
+        (n, p)
+        for n, p in policy.actor.named_parameters()
+        if (not policy.config.shared_encoder or not n.startswith("encoder")) and p.requires_grad
+    ]
+    if getattr(cfg.policy, "type", None) == "sac_act":
+        lr_scale = float(getattr(cfg.policy, "act_finetune_lr_scale", 0.1))
+        lr_scale = max(lr_scale, 0.0)
+        act_policy_params = [p for n, p in actor_named_params if n.startswith("act_policy.")]
+        other_actor_params = [p for n, p in actor_named_params if not n.startswith("act_policy.")]
+
+        actor_param_groups = []
+        if act_policy_params:
+            actor_param_groups.append(
+                {"params": act_policy_params, "lr": cfg.policy.actor_lr * lr_scale}
+            )
+        if other_actor_params:
+            actor_param_groups.append({"params": other_actor_params, "lr": cfg.policy.actor_lr})
+        optimizer_actor = torch.optim.Adam(params=actor_param_groups)
+    else:
+        optimizer_actor = torch.optim.Adam(params=[p for _, p in actor_named_params], lr=cfg.policy.actor_lr)
     optimizer_critic = torch.optim.Adam(params=policy.critic_ensemble.parameters(), lr=cfg.policy.critic_lr)
 
     if cfg.policy.num_discrete_actions is not None:
         optimizer_discrete_critic = torch.optim.Adam(
             params=policy.discrete_critic.parameters(), lr=cfg.policy.critic_lr
         )
-    optimizer_temperature = torch.optim.Adam(params=[policy.log_alpha], lr=cfg.policy.critic_lr)
+    optimizer_temperature = torch.optim.Adam(params=[policy.log_alpha], lr=cfg.policy.temperature_lr)
     lr_scheduler = None
     optimizers = {
         "actor": optimizer_actor,
@@ -1255,9 +1387,13 @@ def process_transitions(
     transition_queue: Queue,
     replay_buffer: ReplayBuffer,
     offline_replay_buffer: ReplayBuffer | None,
+    success_replay_buffer: ReplayBuffer | None,
     device: str,
     prev_intervention: bool,
     shutdown_event: any,
+    *,
+    success_tail_steps: int = 0,
+    success_tail_reward: float | None = None,
 ) -> bool:
     """Process all available transitions from the queue.
 
@@ -1278,6 +1414,106 @@ def process_transitions(
                 return False
             return bool(value.item())
         return bool(value)
+
+    def _as_float(value: object) -> float:
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 1:
+                return float(value.item())
+            return float(value.float().mean().item())
+        try:
+            return float(value)  # type: ignore[arg-type]
+        except Exception:
+            return 0.0
+
+    def _get_last_inserted_idx(buf: ReplayBuffer) -> int:
+        return (buf.position - 1) % buf.capacity
+
+    def _success_tail_indices(buf: ReplayBuffer, terminal_idx: int, tail_steps: int) -> list[int]:
+        if tail_steps <= 0:
+            return []
+
+        indices_rev: list[int] = []
+        full = buf.size >= buf.capacity
+
+        for back in range(tail_steps):
+            if full:
+                idx = (terminal_idx - back) % buf.capacity
+            else:
+                idx = terminal_idx - back
+                if idx < 0:
+                    break
+
+            # Stop when we cross an episode boundary (exclude the previous episode's terminal).
+            if back > 0 and _as_bool(buf.episode_ends[idx]):
+                break
+
+            indices_rev.append(idx)
+
+        return list(reversed(indices_rev))
+
+    def _apply_success_tail_reward_shaping(
+        buf: ReplayBuffer,
+        tail_indices: list[int],
+        terminal_reward: float,
+        *,
+        tail_steps_cfg: int,
+        tail_reward_cfg: float | None,
+    ) -> None:
+        if tail_steps_cfg <= 0 or len(tail_indices) <= 1:
+            return
+
+        # `tail_indices` is chronological and includes the terminal transition as its last element.
+        # We only assign shaping reward to the non-terminal tail transitions.
+        if tail_reward_cfg is None:
+            per_step_reward = terminal_reward / float(tail_steps_cfg)
+        else:
+            per_step_reward = float(tail_reward_cfg)
+
+        if per_step_reward <= 0.0:
+            return
+
+        for idx in tail_indices[:-1]:
+            try:
+                existing = float(buf.rewards[idx].item())
+            except Exception:
+                existing = 0.0
+            if existing < per_step_reward:
+                buf.rewards[idx] = float(per_step_reward)
+
+    def _copy_tail_to_success_buffer(
+        src: ReplayBuffer,
+        dst: ReplayBuffer,
+        tail_indices: list[int],
+    ) -> None:
+        if not tail_indices:
+            return
+
+        for idx in tail_indices:
+            state = {k: src.states[k][idx].unsqueeze(0) for k in src.states}
+            action = src.actions[idx].unsqueeze(0)
+            reward = float(src.rewards[idx].item())
+            done = bool(src.dones[idx].item())
+            truncated = bool(src.truncateds[idx].item())
+
+            complementary_info = None
+            if src.has_complementary_info:
+                complementary_info = {}
+                for key in src.complementary_info_keys:
+                    val = src.complementary_info[key][idx]
+                    if isinstance(val, torch.Tensor):
+                        complementary_info[key] = val.unsqueeze(0) if val.ndim > 0 else val.view(1)
+                    elif isinstance(val, (int, float, bool)):
+                        complementary_info[key] = torch.tensor([val], device=src.storage_device)
+
+            dst.add(
+                state=state,
+                action=action,
+                reward=reward,
+                next_state={},
+                done=done,
+                truncated=truncated,
+                complementary_info=complementary_info,
+            )
 
     while not transition_queue.empty() and not shutdown_event.is_set():
         transition_list = transition_queue.get()
@@ -1300,6 +1536,26 @@ def process_transitions(
                 continue
 
             replay_buffer.add(**transition)
+
+            # Sparse success-label shaping: spread a small positive reward to the last N transitions of a
+            # successful episode, and optionally store them in a dedicated success buffer.
+            if success_tail_steps > 0:
+                terminal_reward = _as_float(transition.get("reward", 0.0))
+                is_terminal = _as_bool(transition.get("done", False)) or _as_bool(
+                    transition.get("truncated", False)
+                )
+                if is_terminal and terminal_reward > 0.0:
+                    terminal_idx = _get_last_inserted_idx(replay_buffer)
+                    tail_indices = _success_tail_indices(replay_buffer, terminal_idx, success_tail_steps)
+                    _apply_success_tail_reward_shaping(
+                        replay_buffer,
+                        tail_indices,
+                        terminal_reward,
+                        tail_steps_cfg=success_tail_steps,
+                        tail_reward_cfg=success_tail_reward,
+                    )
+                    if success_replay_buffer is not None:
+                        _copy_tail_to_success_buffer(replay_buffer, success_replay_buffer, tail_indices)
 
             # HIL-SERL "human buffer" logic:
             # - Insert intervention transitions.

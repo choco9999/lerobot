@@ -34,6 +34,7 @@ from torch.distributions import MultivariateNormal, TanhTransform, Transform, Tr
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.sac.configuration_sac import SACActConfig, SACConfig, is_image_feature
 from lerobot.policies.utils import get_device_from_parameters
+from lerobot.teleoperators.utils import TeleopEvents
 from lerobot.configs.types import NormalizationMode
 from lerobot.utils.constants import (
     ACTION,
@@ -101,6 +102,7 @@ class SACPolicy(
             observations_features = self.actor.encoder.get_cached_image_features(batch)
 
         actions, _, _ = self.actor(batch, observations_features)
+        actions, _ = self._project_actions_to_max_relative_target(observations=batch, actions=actions)
 
         if self.config.num_discrete_actions is not None:
             discrete_action_value = self.discrete_critic(batch, observations_features)
@@ -212,10 +214,13 @@ class SACPolicy(
             )
             return {"loss_discrete_critic": loss_discrete_critic}
         if model == "actor":
+            complementary_info = batch.get("complementary_info")
             return {
                 "loss_actor": self.compute_loss_actor(
                     observations=observations,
                     observation_features=observation_features,
+                    actions=actions,
+                    complementary_info=complementary_info,
                 )
             }
 
@@ -254,6 +259,99 @@ class SACPolicy(
     def update_temperature(self):
         self.temperature = self.log_alpha.exp().item()
 
+    def _project_actions_to_max_relative_target(
+        self, observations: dict[str, Tensor], actions: Tensor
+    ) -> tuple[Tensor, dict[str, Tensor] | None]:
+        """Project normalized actions to respect `config.max_relative_target` (if configured).
+
+        The real-robot control loop clamps *absolute joint targets* to be at most
+        `max_relative_target` away from the current joint positions. During training,
+        the critic is fit on executed (clamped) actions, but the actor may otherwise
+        optimize Q-values for unreachable (pre-clamp) actions, leading to policy drift.
+
+        This helper mirrors the robot-side clamp in the SAC loss computation so that:
+        - critic targets use reachable next actions
+        - actor gradients optimize Q(s, a_executed)
+        """
+        max_relative_target = getattr(self.config, "max_relative_target", None)
+        if max_relative_target is None:
+            return actions, None
+
+        if not isinstance(actions, Tensor) or actions.ndim != 2:
+            return actions, None
+
+        state = observations.get(OBS_STATE)
+        if not isinstance(state, Tensor):
+            return actions, None
+        if state.ndim == 1:
+            state = state.unsqueeze(0)
+        if state.ndim != 2 or state.shape[0] != actions.shape[0]:
+            return actions, None
+
+        action_dim = int(actions.shape[-1])
+        if state.shape[-1] < action_dim:
+            return actions, None
+
+        dataset_stats = getattr(self.config, "dataset_stats", None)
+        if not isinstance(dataset_stats, dict):
+            return actions, None
+
+        action_stats = dataset_stats.get(ACTION, {})
+        if not isinstance(action_stats, dict):
+            return actions, None
+
+        if "min" not in action_stats or "max" not in action_stats:
+            return actions, None
+
+        try:
+            action_min = torch.as_tensor(action_stats["min"], device=actions.device, dtype=actions.dtype).view(
+                1, -1
+            )
+            action_max = torch.as_tensor(action_stats["max"], device=actions.device, dtype=actions.dtype).view(
+                1, -1
+            )
+        except Exception:
+            return actions, None
+
+        if action_min.numel() != action_dim or action_max.numel() != action_dim:
+            return actions, None
+
+        present = state[:, :action_dim].to(device=actions.device, dtype=actions.dtype)
+
+        denom = (action_max - action_min).clamp(min=1e-6)
+        action_robot = 0.5 * (actions + 1.0) * denom + action_min
+
+        try:
+            max_diff_val = float(max_relative_target)
+        except Exception:
+            return actions, None
+        if max_diff_val < 0:
+            return actions, None
+
+        max_diff = torch.full_like(action_robot, max_diff_val)
+        diff = action_robot - present
+        safe_diff = torch.minimum(diff, max_diff)
+        safe_diff = torch.maximum(safe_diff, -max_diff)
+        clamped_action_robot = present + safe_diff
+        clamped_action_robot = torch.minimum(torch.maximum(clamped_action_robot, action_min), action_max)
+
+        clamped_actions = 2.0 * (clamped_action_robot - action_min) / denom - 1.0
+        clamped_actions = clamped_actions.clamp(min=-1.0, max=1.0)
+
+        # Lightweight stats (stay as tensors to let the caller decide when to sync).
+        action_delta_max = diff.abs().max(dim=-1)[0]
+        clamp_amount_max = (action_robot - clamped_action_robot).abs().max(dim=-1)[0]
+        violation = (actions - clamped_actions).abs().max(dim=-1)[0]
+        clamped_mask = violation > 1e-6
+
+        stats = {
+            "max_relative_target_delta_max_mean": action_delta_max.mean(),
+            "max_relative_target_clamp_amount_max_mean": clamp_amount_max.mean(),
+            "max_relative_target_violation_max_mean": violation.mean(),
+            "max_relative_target_clamp_frac": clamped_mask.float().mean(),
+        }
+        return clamped_actions, stats
+
     def compute_loss_critic(
         self,
         observations,
@@ -266,6 +364,13 @@ class SACPolicy(
     ) -> Tensor:
         with torch.no_grad():
             next_action_preds, next_log_probs, _ = self.actor(next_observations, next_observation_features)
+            next_action_preds, proj_stats = self._project_actions_to_max_relative_target(
+                observations=next_observations,
+                actions=next_action_preds,
+            )
+            if proj_stats is not None:
+                # Detached scalars for optional logging by the learner.
+                self._last_max_relative_target_stats_critic = {k: v.detach() for k, v in proj_stats.items()}
 
             # 2- compute q targets
             q_targets = self.critic_forward(
@@ -386,18 +491,65 @@ class SACPolicy(
         self,
         observations,
         observation_features: Tensor | None = None,
+        actions: Tensor | None = None,
+        complementary_info: dict | None = None,
     ) -> Tensor:
-        actions_pi, log_probs, _ = self.actor(observations, observation_features)
+        actions_pi, log_probs, actor_aux = self.actor(observations, observation_features)
+        try:
+            residual_stats = getattr(self.actor, "_last_residual_stats", None)
+            if isinstance(residual_stats, dict):
+                self._last_act_residual_stats = {k: v.detach() for k, v in residual_stats.items()}
+        except Exception:
+            pass
+        actions_pi_projected, stats = self._project_actions_to_max_relative_target(
+            observations=observations,
+            actions=actions_pi,
+        )
+        if stats is not None:
+            # Detached scalars for optional logging by the learner.
+            self._last_max_relative_target_stats_actor = {k: v.detach() for k, v in stats.items()}
 
         q_preds = self.critic_forward(
             observations=observations,
-            actions=actions_pi,
+            actions=actions_pi_projected,
             use_target=False,
             observation_features=observation_features,
         )
         min_q_preds = q_preds.min(dim=0)[0]
 
         actor_loss = ((self.temperature * log_probs) - min_q_preds).mean()
+
+        penalty_weight = float(getattr(self.config, "max_relative_target_violation_penalty", 0.0) or 0.0)
+        if penalty_weight > 0.0 and stats is not None:
+            # Encourage the policy to stay within the reachable set (in normalized action space).
+            actor_loss = actor_loss + penalty_weight * stats["max_relative_target_violation_max_mean"]
+
+        bc_weight = float(getattr(self.config, "intervention_bc_loss_weight", 0.0) or 0.0)
+        if bc_weight > 0.0 and isinstance(actions, Tensor) and isinstance(complementary_info, dict):
+            is_intervention = complementary_info.get(TeleopEvents.IS_INTERVENTION.value)
+            if is_intervention is None:
+                is_intervention = complementary_info.get(TeleopEvents.IS_INTERVENTION)
+            if isinstance(is_intervention, Tensor) and is_intervention.numel() == actions.shape[0]:
+                mask = is_intervention.view(-1) > 0.5
+                if bool(mask.any().item()):
+                    # Use the deterministic policy action (mode) for BC regularization:
+                    # - SAC: tanh(mean)
+                    # - SAC-ACT: ACT prior action (already in [-1, 1] space)
+                    deterministic_action = actor_aux
+                    if not hasattr(self.actor, "prior_action"):
+                        deterministic_action = torch.tanh(deterministic_action)
+                    if isinstance(deterministic_action, Tensor) and deterministic_action.ndim == 2:
+                        action_dim = int(deterministic_action.shape[-1])
+                        target = actions[:, :action_dim] if actions.shape[-1] >= action_dim else actions
+                        target = target.to(device=deterministic_action.device, dtype=deterministic_action.dtype)
+                        deterministic_action, _ = self._project_actions_to_max_relative_target(
+                            observations=observations,
+                            actions=deterministic_action,
+                        )
+                        bc_loss = F.mse_loss(deterministic_action[mask], target[mask])
+                        self._last_intervention_bc_loss = bc_loss.detach()
+                        actor_loss = actor_loss + bc_weight * bc_loss
+
         return actor_loss
 
     def _init_encoders(self):
@@ -1093,6 +1245,9 @@ class _ACTGaussianActor(nn.Module):
         act_action_norm_mode: NormalizationMode | None = None,
         prefetch_action_queue: bool = False,
         prefetch_min_queue_len: int = 10,
+        freeze_act_policy: bool = False,
+        residual_network: nn.Module | None = None,
+        residual_scale: float = 0.0,
     ) -> None:
         super().__init__()
         self.act_policy = act_policy
@@ -1103,12 +1258,20 @@ class _ACTGaussianActor(nn.Module):
         self.act_action_norm_mode = act_action_norm_mode
         self._prefetch_action_queue = bool(prefetch_action_queue)
         self._prefetch_min_queue_len = max(0, int(prefetch_min_queue_len))
+        self._freeze_act_policy = bool(freeze_act_policy)
+        self.residual_network = residual_network
+        self.residual_scale = float(residual_scale)
+        self._last_residual_stats: dict[str, Tensor] | None = None
 
         self._prefetch_generation: int = 0
         self._prefetch_thread: threading.Thread | None = None
         self._prefetch_lock = threading.Lock()
         self._act_queue_lock = threading.Lock()
         self._act_forward_lock = threading.Lock()
+
+        if self._freeze_act_policy and isinstance(self.act_policy, nn.Module):
+            for param in self.act_policy.parameters():
+                param.requires_grad = False
 
         if (action_min is None) != (action_max is None):
             raise ValueError("action_min and action_max must be provided together (or both be None).")
@@ -1135,6 +1298,71 @@ class _ACTGaussianActor(nn.Module):
         if init_std <= 0:
             raise ValueError(f"init_std must be > 0, got {init_std}")
         self.log_std = nn.Parameter(torch.full((action_dim,), math.log(init_std), dtype=torch.float32))
+
+    def _compute_residual(self, observations: dict[str, Tensor], *, batch: int) -> Tensor:
+        if self.residual_network is None or self.residual_scale <= 0.0:
+            self._last_residual_stats = {
+                "act_residual_mean_abs": torch.tensor(0.0, device=self.log_std.device),
+                "act_residual_max_abs": torch.tensor(0.0, device=self.log_std.device),
+            }
+            return torch.zeros((batch, self.log_std.shape[0]), dtype=torch.float32, device=self.log_std.device)
+
+        state = observations.get(OBS_STATE)
+        if not isinstance(state, Tensor):
+            return torch.zeros((batch, self.log_std.shape[0]), dtype=torch.float32, device=self.log_std.device)
+        if state.ndim == 1:
+            state = state.unsqueeze(0)
+        if state.ndim != 2:
+            return torch.zeros((batch, self.log_std.shape[0]), dtype=torch.float32, device=self.log_std.device)
+
+        action_dim = int(self.log_std.shape[0])
+        if state.shape[-1] < action_dim:
+            return torch.zeros((batch, self.log_std.shape[0]), dtype=torch.float32, device=self.log_std.device)
+
+        state_in = state[:, :action_dim].to(device=self.log_std.device, dtype=torch.float32, non_blocking=True)
+        # Normalize state to roughly [-1, 1] when action bounds are known (common for joint-space absolute targets).
+        if self._action_min is not None and self._action_max is not None:
+            try:
+                action_min = self._action_min.to(device=state_in.device, dtype=state_in.dtype)
+                action_max = self._action_max.to(device=state_in.device, dtype=state_in.dtype)
+                if action_min.numel() == action_dim and action_max.numel() == action_dim:
+                    denom = (action_max - action_min).clamp(min=1e-6)
+                    state_in = 2.0 * (state_in - action_min) / denom - 1.0
+            except Exception:
+                pass
+        residual_raw = self.residual_network(state_in)
+        if not isinstance(residual_raw, Tensor) or residual_raw.shape != (state_in.shape[0], self.log_std.shape[0]):
+            self._last_residual_stats = {
+                "act_residual_mean_abs": torch.tensor(0.0, device=self.log_std.device),
+                "act_residual_max_abs": torch.tensor(0.0, device=self.log_std.device),
+            }
+            return torch.zeros((batch, self.log_std.shape[0]), dtype=torch.float32, device=self.log_std.device)
+        residual = torch.tanh(residual_raw) * float(self.residual_scale)
+        try:
+            self._last_residual_stats = {
+                "act_residual_mean_abs": residual.abs().mean().detach(),
+                "act_residual_max_abs": residual.abs().max().detach(),
+            }
+        except Exception:
+            self._last_residual_stats = None
+        return residual
+
+    def _apply_residual(self, base_action: Tensor, observations: dict[str, Tensor]) -> Tensor:
+        if self.residual_network is None or self.residual_scale <= 0.0:
+            return base_action
+        if not isinstance(base_action, Tensor):
+            return base_action
+        if base_action.ndim == 1:
+            base_action = base_action.unsqueeze(0)
+        if base_action.ndim != 2:
+            return base_action
+
+        batch = int(base_action.shape[0])
+        residual = self._compute_residual(observations, batch=batch)
+        if residual.shape != base_action.shape:
+            return base_action
+        residual = residual.to(device=base_action.device, dtype=base_action.dtype, non_blocking=True)
+        return (base_action + residual).clamp(min=-1.0, max=1.0)
 
     def train(self, mode: bool = True):
         # Keep ACT in eval mode even when fine-tuning with RL:
@@ -1268,7 +1496,11 @@ class _ACTGaussianActor(nn.Module):
             raise TypeError("ACT policy is missing a `.model` nn.Module.")
 
         with self._act_forward_lock:
-            actions_seq, _ = act_model(batch)
+            if self._freeze_act_policy:
+                with torch.no_grad():
+                    actions_seq, _ = act_model(batch)
+            else:
+                actions_seq, _ = act_model(batch)
 
         if hasattr(self.act_policy, "_last_action_chunk"):
             try:
@@ -1353,7 +1585,11 @@ class _ACTGaussianActor(nn.Module):
         if not isinstance(act_model, nn.Module):
             raise TypeError("ACT policy is missing a `.model` nn.Module.")
 
-        actions_seq, _ = act_model(batch)
+        if self._freeze_act_policy:
+            with torch.no_grad():
+                actions_seq, _ = act_model(batch)
+        else:
+            actions_seq, _ = act_model(batch)
         # Best-effort cache of the latest predicted chunk for logging/debugging. This is useful when
         # `use_action_queue` is False (otherwise ACTPolicy.select_action manages chunking internally).
         if hasattr(self.act_policy, "_last_action_chunk"):
@@ -1444,7 +1680,8 @@ class _ACTGaussianActor(nn.Module):
             if remaining <= self._prefetch_min_queue_len:
                 self._maybe_start_prefetch(observations)
 
-            return act_action.clamp(min=-1.0, max=1.0)
+            act_action = act_action.clamp(min=-1.0, max=1.0)
+            return self._apply_residual(act_action, observations)
 
         # Fallback: single-step ACT inference (may be expensive, but used for training and/or
         # when ACT temporal ensembling is enabled).
@@ -1461,7 +1698,8 @@ class _ACTGaussianActor(nn.Module):
             # ACTION normalization during ACT training used MIN_MAX).
             pass
 
-        return act_action.clamp(min=-1.0, max=1.0)
+        act_action = act_action.clamp(min=-1.0, max=1.0)
+        return self._apply_residual(act_action, observations)
 
     def _sample_from_prior(self, prior_action: Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if prior_action.device != self.log_std.device:
@@ -1594,6 +1832,34 @@ class SACActPolicy(SACPolicy):
                 "so SAC-ACT can map ACT actions back into SAC's [-1, 1] space."
             )
 
+        residual_network = None
+        residual_scale = float(getattr(cfg, "act_residual_scale", 0.0) or 0.0)
+        if residual_scale > 0.0:
+            # Residual policy head: small MLP on robot state only.
+            state_ft = (cfg.input_features or {}).get(OBS_STATE)
+            state_dim = None
+            if state_ft is not None and getattr(state_ft, "shape", None):
+                try:
+                    state_dim = int(state_ft.shape[0])
+                except Exception:
+                    state_dim = None
+            if state_dim is None:
+                raise ValueError("act_residual_scale>0 requires `observation.state` in policy.input_features.")
+
+            hidden_dims = list(getattr(cfg, "act_residual_hidden_dims", [64, 64]))
+            layers: list[nn.Module] = []
+            prev = state_dim
+            for h in hidden_dims:
+                layers.append(nn.Linear(prev, int(h)))
+                layers.append(nn.ReLU())
+                prev = int(h)
+            out = nn.Linear(prev, continuous_action_dim)
+            # Start from the pretrained ACT behavior (zero residual).
+            nn.init.zeros_(out.weight)
+            nn.init.zeros_(out.bias)
+            layers.append(out)
+            residual_network = nn.Sequential(*layers)
+
         self.actor = _ACTGaussianActor(
             act_policy=act_policy,
             act_image_features=act_image_features,
@@ -1607,6 +1873,9 @@ class SACActPolicy(SACPolicy):
             act_action_norm_mode=act_action_norm_mode,
             prefetch_action_queue=getattr(cfg, "act_prefetch_action_queue", False),
             prefetch_min_queue_len=getattr(cfg, "act_prefetch_min_queue_len", 10),
+            freeze_act_policy=bool(getattr(cfg, "act_freeze_backbone", False)),
+            residual_network=residual_network,
+            residual_scale=residual_scale,
         )
 
         # Keep SAC target entropy logic.
@@ -1628,6 +1897,8 @@ class SACActPolicy(SACPolicy):
             actions = prior_action
         else:
             actions, _ = self.actor._sample_from_prior(prior_action)
+
+        actions, _ = self._project_actions_to_max_relative_target(observations=batch, actions=actions)
 
         if self.config.num_discrete_actions is not None:
             discrete_action_value = self.discrete_critic(batch, None)
