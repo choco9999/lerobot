@@ -63,9 +63,8 @@ def move_transition_to_device(transition: Transition, device: str = "cpu") -> Tr
         for key, val in transition["complementary_info"].items():
             if isinstance(val, torch.Tensor):
                 transition["complementary_info"][key] = val.to(device, non_blocking=non_blocking)
-            elif isinstance(val, (int, float, bool)):
-                # Keep a batch dimension to match other tensor fields.
-                transition["complementary_info"][key] = torch.tensor([val], device=device)
+            elif isinstance(val, (int | float | bool)):
+                transition["complementary_info"][key] = torch.tensor(val, device=device)
             else:
                 raise ValueError(f"Unsupported type {type(val)} for complementary_info[{key}]")
     return transition

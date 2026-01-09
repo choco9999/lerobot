@@ -33,37 +33,6 @@ from lerobot.utils.hub import HubMixin
 TRAIN_CONFIG_NAME = "train_config.json"
 
 
-def _infer_latest_run_dir(job_name: str) -> Path | None:
-    """Infer the most recent `outputs/train/..._*{job_name}` directory that has a checkpoint.
-
-    This is a convenience for `resume=true` runs where `output_dir` was not explicitly set.
-    """
-    if not job_name:
-        return None
-
-    root = Path("outputs/train")
-    if not root.exists():
-        return None
-
-    suffix = f"_{job_name}"
-    candidates: list[Path] = []
-
-    for date_dir in root.iterdir():
-        if not date_dir.is_dir():
-            continue
-        for run_dir in date_dir.iterdir():
-            if not run_dir.is_dir() or not run_dir.name.endswith(suffix):
-                continue
-            checkpoint_cfg = run_dir / "checkpoints" / "last" / "pretrained_model" / TRAIN_CONFIG_NAME
-            if checkpoint_cfg.exists():
-                candidates.append(run_dir)
-
-    if not candidates:
-        return None
-
-    return max(candidates, key=lambda p: p.stat().st_mtime)
-
-
 @dataclass
 class TrainPipelineConfig(HubMixin):
     dataset: DatasetConfig
@@ -242,65 +211,3 @@ class TrainRLServerPipelineConfig(TrainPipelineConfig):
     # NOTE: In RL, we don't need an offline dataset
     # TODO: Make `TrainPipelineConfig.dataset` optional
     dataset: DatasetConfig | None = None  # type: ignore[assignment] # because the parent class has made it's type non-optional
-    # When True, the learner exports the replay buffer to `<output_dir>/dataset` when saving checkpoints.
-    # This can be very slow on real-robot runs (images) and may stall training/control loops.
-    save_replay_buffer_dataset: bool = False
-
-    def validate(self) -> None:  # noqa: C901
-        # Same validation logic as TrainPipelineConfig, but allow dataset to be optional.
-        policy_path = parser.get_path_arg("policy")
-        if policy_path:
-            cli_overrides = parser.get_cli_overrides("policy")
-            self.policy = PreTrainedConfig.from_pretrained(policy_path, cli_overrides=cli_overrides)
-            self.policy.pretrained_path = Path(policy_path)
-        elif self.resume:
-            # NOTE: In RL, resume is handled by the learner via `output_dir/checkpoints/last`.
-            # Keep this validation lightweight and avoid overriding `policy.pretrained_path`
-            # based on the config file location (which is often `src/...`).
-            config_path = parser.parse_arg("config_path")
-            if config_path and not Path(config_path).resolve().exists():
-                raise NotADirectoryError(
-                    f"{config_path=} is expected to be a local path. "
-                    "Resuming from the hub is not supported for now."
-                )
-
-        if self.policy is None:
-            raise ValueError("Policy is not configured. Please specify a pretrained policy with `--policy.path`.")
-
-        if not self.job_name:
-            if self.env is None:
-                self.job_name = f"{self.policy.type}"
-            else:
-                self.job_name = f"{self.env.type}_{self.policy.type}"
-
-        # NOTE: Unlike offline training, RL uses multiple processes (learner + actor) that may be
-        # started independently and should be able to share the same `output_dir`. We therefore do
-        # not error when `output_dir` already exists for `resume=False`.
-        #
-        # Safety for resuming/overwriting an existing checkpointed run is handled by the learner in
-        # `lerobot.rl.learner.handle_resume_logic` (via `output_dir/checkpoints/last`).
-        if not self.output_dir:
-            if self.resume:
-                inferred = _infer_latest_run_dir(job_name=str(self.job_name))
-                if inferred is None:
-                    raise ValueError(
-                        "resume=true requires `output_dir` to point to a previous run directory, "
-                        "or an existing run under `outputs/train/...` for the same `job_name`."
-                    )
-                self.output_dir = inferred
-            else:
-                now = dt.datetime.now()
-                train_dir = f"{now:%Y-%m-%d}/{now:%H-%M-%S}_{self.job_name}"
-                self.output_dir = Path("outputs/train") / train_dir
-
-        if self.dataset is not None and isinstance(self.dataset.repo_id, list):
-            raise NotImplementedError("LeRobotMultiDataset is not currently implemented.")
-
-        if not self.use_policy_training_preset and (self.optimizer is None or self.scheduler is None):
-            raise ValueError("Optimizer and Scheduler must be set when the policy presets are not used.")
-        elif self.use_policy_training_preset and not self.resume:
-            self.optimizer = self.policy.get_optimizer_preset()
-            self.scheduler = self.policy.get_scheduler_preset()
-
-        if self.policy.push_to_hub and not self.policy.repo_id:
-            raise ValueError("'policy.repo_id' argument missing. Please specify it to push the model to the hub.")

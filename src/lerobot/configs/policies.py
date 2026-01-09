@@ -181,19 +181,10 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
         model_id = str(pretrained_name_or_path)
         config_file: str | None = None
         if Path(model_id).is_dir():
-            local_config_path = Path(model_id) / CONFIG_NAME
-            if local_config_path.is_file():
-                config_file = str(local_config_path)
+            if CONFIG_NAME in os.listdir(model_id):
+                config_file = os.path.join(model_id, CONFIG_NAME)
             else:
-                local_dir = Path(model_id)
-                if (local_dir / "data").is_dir() and (local_dir / "meta").is_dir():
-                    raise FileNotFoundError(
-                        f"{CONFIG_NAME} not found in {local_dir.resolve()}.\n"
-                        "This path looks like a LeRobot dataset directory (it contains 'data/' and 'meta/').\n"
-                        "For `*.from_pretrained(...)` you must pass a saved policy directory that contains "
-                        f"'{CONFIG_NAME}' (and typically 'model.safetensors')."
-                    )
-                raise FileNotFoundError(f"{CONFIG_NAME} not found in {local_dir.resolve()}")
+                logger.error(f"{CONFIG_NAME} not found in {Path(model_id).resolve()}")
         else:
             try:
                 config_file = hf_hub_download(
@@ -212,15 +203,15 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
                     f"{CONFIG_NAME} not found on the HuggingFace Hub in {model_id}"
                 ) from e
 
-        if config_file is None:
-            raise FileNotFoundError(f"{CONFIG_NAME} not found in {model_id}")
-
         # HACK: Parse the original config to get the config subclass, so that we can
         # apply cli overrides.
         # This is very ugly, ideally we'd like to be able to do that natively with draccus
         # something like --policy.path (in addition to --policy.type)
         with draccus.config_type("json"):
             orig_config = draccus.parse(cls, config_file, args=[])
+
+        if config_file is None:
+            raise FileNotFoundError(f"{CONFIG_NAME} not found in {model_id}")
 
         with open(config_file) as f:
             config = json.load(f)

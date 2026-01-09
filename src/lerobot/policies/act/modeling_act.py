@@ -66,11 +66,6 @@ class ACTPolicy(PreTrainedPolicy):
         if config.temporal_ensemble_coeff is not None:
             self.temporal_ensembler = ACTTemporalEnsembler(config.temporal_ensemble_coeff, config.chunk_size)
 
-        # Cache the most recent predicted action chunk for optional logging/debugging.
-        # Shape: (batch, chunk_size, action_dim)
-        self._last_action_chunk: Tensor | None = None
-        self._last_action_chunk_id: int = 0
-
         self.reset()
 
     def get_optim_params(self) -> dict:
@@ -100,8 +95,6 @@ class ACTPolicy(PreTrainedPolicy):
             self.temporal_ensembler.reset()
         else:
             self._action_queue = deque([], maxlen=self.config.n_action_steps)
-        self._last_action_chunk = None
-        self._last_action_chunk_id = 0
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
@@ -138,10 +131,6 @@ class ACTPolicy(PreTrainedPolicy):
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
 
         actions = self.model(batch)[0]
-        # Store for external inspection (e.g., actor-side logging). This is updated only when a new
-        # model forward pass happens (i.e., when the ACT queue is refreshed).
-        self._last_action_chunk = actions
-        self._last_action_chunk_id += 1
         return actions
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:

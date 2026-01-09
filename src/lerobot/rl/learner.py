@@ -25,7 +25,7 @@ Examples of usage:
 
 - Start a learner server for training:
 ```bash
-python -m lerobot.rl.learner --config_path src/lerobot/configs/train_config_hilserl_so101.json
+python -m lerobot.rl.learner --config_path src/lerobot/configs/train_config_hilserl_so100.json
 ```
 
 **NOTE**: Start the learner server before launching the actor server. The learner opens a gRPC server
@@ -51,8 +51,6 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from pprint import pformat
-from queue import Empty as QueueEmpty
-from queue import Full as QueueFull
 
 import grpc
 import torch
@@ -71,8 +69,8 @@ from lerobot.policies.sac.modeling_sac import SACPolicy
 from lerobot.rl.buffer import ReplayBuffer, concatenate_batch_transitions
 from lerobot.rl.process import ProcessSignalHandler
 from lerobot.rl.wandb_utils import WandBLogger
-from lerobot.robots import so100_follower, so101_follower  # noqa: F401
-from lerobot.teleoperators import gamepad, so101_leader  # noqa: F401
+from lerobot.robots import so_follower  # noqa: F401
+from lerobot.teleoperators import gamepad, so_leader  # noqa: F401
 from lerobot.teleoperators.utils import TeleopEvents
 from lerobot.transport import services_pb2_grpc
 from lerobot.transport.utils import (
@@ -192,20 +190,10 @@ def start_learner_threads(
         wandb_logger (WandBLogger | None): Logger for metrics
         shutdown_event: Event to signal shutdown
     """
-    # Use thread queues when running fully threaded to avoid OS-level semaphores.
-    if use_threads(cfg):
-        import queue as _queue
-
-        # Keep these bounded: the actor can produce very large transition messages (images). When the learner
-        # stalls (e.g. during checkpointing) an unbounded queue can quickly eat RAM and destabilize control.
-        transition_queue = _queue.Queue(maxsize=8)
-        interaction_message_queue = _queue.Queue(maxsize=256)
-        # Only the most recent parameters matter; keep this tiny and drop old ones on push.
-        parameters_queue = _queue.Queue(maxsize=1)
-    else:
-        transition_queue = Queue(maxsize=8)
-        interaction_message_queue = Queue(maxsize=256)
-        parameters_queue = Queue(maxsize=1)
+    # Create multiprocessing queues
+    transition_queue = Queue()
+    interaction_message_queue = Queue()
+    parameters_queue = Queue()
 
     concurrency_entity = None
 
@@ -242,19 +230,17 @@ def start_learner_threads(
     logging.info("[LEARNER] Training process stopped")
 
     logging.info("[LEARNER] Closing queues")
-    if not use_threads(cfg):
-        transition_queue.close()
-        interaction_message_queue.close()
-        parameters_queue.close()
+    transition_queue.close()
+    interaction_message_queue.close()
+    parameters_queue.close()
 
     communication_process.join()
     logging.info("[LEARNER] Communication process joined")
 
     logging.info("[LEARNER] join queues")
-    if not use_threads(cfg):
-        transition_queue.cancel_join_thread()
-        interaction_message_queue.cancel_join_thread()
-        parameters_queue.cancel_join_thread()
+    transition_queue.cancel_join_thread()
+    interaction_message_queue.cancel_join_thread()
+    parameters_queue.cancel_join_thread()
 
     logging.info("[LEARNER] queues closed")
 
@@ -327,26 +313,6 @@ def add_actor_information_and_train(
 
     assert isinstance(policy, nn.Module)
 
-    # Keep SAC(-ACT) training consistent with the real-robot action clamp by propagating
-    # `env.robot.max_relative_target` into the policy config (if not already set).
-    try:
-        env_robot = getattr(cfg.env, "robot", None)
-        env_max_relative_target = (
-            getattr(env_robot, "max_relative_target", None) if env_robot is not None else None
-        )
-        if (
-            env_max_relative_target is not None
-            and getattr(getattr(cfg.env, "processor", None), "inverse_kinematics", None) is None
-            and getattr(getattr(policy, "config", None), "max_relative_target", None) is None
-        ):
-            policy.config.max_relative_target = float(env_max_relative_target)
-            logging.info(
-                "[LEARNER] policy.max_relative_target set from env.robot.max_relative_target=%s",
-                policy.config.max_relative_target,
-            )
-    except Exception:
-        logging.debug("[LEARNER] Failed to propagate env.robot.max_relative_target into policy config.")
-
     policy.train()
 
     push_actor_policy_to_queue(parameters_queue=parameters_queue, policy=policy)
@@ -361,39 +327,16 @@ def add_actor_information_and_train(
     log_training_info(cfg=cfg, policy=policy)
 
     replay_buffer = initialize_replay_buffer(cfg, device, storage_device)
-    offline_replay_buffer = initialize_offline_replay_buffer(
-        cfg=cfg,
-        device=device,
-        storage_device=storage_device,
-    )
-    success_tail_steps = int(getattr(cfg.policy, "success_reward_shaping_tail_steps", 0) or 0)
-    success_tail_reward = getattr(cfg.policy, "success_reward_shaping_tail_reward", None)
-    success_buffer_capacity = int(getattr(cfg.policy, "success_replay_buffer_capacity", 0) or 0)
-    success_replay_buffer: ReplayBuffer | None = None
-    if success_tail_steps > 0 and success_buffer_capacity > 0:
-        success_replay_buffer = ReplayBuffer(
-            capacity=success_buffer_capacity,
+    batch_size = cfg.batch_size
+    offline_replay_buffer = None
+
+    if cfg.dataset is not None:
+        offline_replay_buffer = initialize_offline_replay_buffer(
+            cfg=cfg,
             device=device,
-            state_keys=cfg.policy.input_features.keys(),
             storage_device=storage_device,
-            optimize_memory=True,
         )
-        logging.info(
-            "[LEARNER] Success-tail shaping enabled (tail_steps=%s, tail_reward=%s) with success buffer capacity=%s.",
-            success_tail_steps,
-            success_tail_reward,
-            success_buffer_capacity,
-        )
-    elif success_tail_steps > 0:
-        logging.info(
-            "[LEARNER] Success-tail shaping enabled (tail_steps=%s, tail_reward=%s) without a success buffer.",
-            success_tail_steps,
-            success_tail_reward,
-        )
-    # HIL-SERL uses 50/50 sampling between the online buffer and a "human" buffer
-    # (offline demos + online human interventions).
-    online_batch_size = max(1, cfg.batch_size // 2)
-    offline_batch_size = max(1, cfg.batch_size - online_batch_size)
+        batch_size: int = batch_size // 2  # We will sample from both replay buffer
 
     logging.info("Starting learner thread")
     interaction_message = None
@@ -406,10 +349,7 @@ def add_actor_information_and_train(
 
     # Initialize iterators
     online_iterator = None
-    prev_intervention = False
-    warned_missing_human_batch = False
-    warned_missing_success_batch = False
-    logged_using_success_buffer = False
+    offline_iterator = None
 
     # NOTE: THIS IS THE MAIN LOOP OF THE LEARNER
     while True:
@@ -419,16 +359,13 @@ def add_actor_information_and_train(
             break
 
         # Process all available transitions to the replay buffer, send by the actor server
-        prev_intervention = process_transitions(
+        process_transitions(
             transition_queue=transition_queue,
             replay_buffer=replay_buffer,
             offline_replay_buffer=offline_replay_buffer,
-            success_replay_buffer=success_replay_buffer,
             device=device,
-            prev_intervention=prev_intervention,
+            dataset_repo_id=dataset_repo_id,
             shutdown_event=shutdown_event,
-            success_tail_steps=success_tail_steps,
-            success_tail_reward=success_tail_reward,
         )
 
         # Process all available interaction messages sent by the actor server
@@ -445,63 +382,24 @@ def add_actor_information_and_train(
 
         if online_iterator is None:
             online_iterator = replay_buffer.get_iterator(
-                batch_size=online_batch_size, async_prefetch=async_prefetch, queue_size=2
+                batch_size=batch_size, async_prefetch=async_prefetch, queue_size=2
             )
 
-        def _sample_hilserl_batch() -> dict:
-            nonlocal warned_missing_human_batch, warned_missing_success_batch, logged_using_success_buffer
-            batch = next(online_iterator)
-            try:
-                batch_human = offline_replay_buffer.sample_by_complementary_key(
-                    TeleopEvents.IS_INTERVENTION.value,
-                    batch_size=offline_batch_size,
-                    threshold=0.5,
-                    fallback_to_random=False,
-                )
-                return concatenate_batch_transitions(
-                    left_batch_transitions=batch, right_batch_transition=batch_human
-                )
-            except Exception as exc:
-                if not warned_missing_human_batch:
-                    logging.info(
-                        "[LEARNER] Human buffer not ready (%s); training on online-only batches for now.",
-                        exc,
-                    )
-                    warned_missing_human_batch = True
-
-            if success_replay_buffer is not None:
-                try:
-                    batch_success = success_replay_buffer.sample(offline_batch_size)
-                    if not logged_using_success_buffer:
-                        logging.info(
-                            "[LEARNER] Using success buffer for auxiliary batches (size=%s).",
-                            len(success_replay_buffer),
-                        )
-                        logged_using_success_buffer = True
-                    return concatenate_batch_transitions(
-                        left_batch_transitions=batch,
-                        right_batch_transition=batch_success,
-                    )
-                except Exception as exc:
-                    if not warned_missing_success_batch:
-                        logging.info(
-                            "[LEARNER] Success buffer not ready (%s); falling back to online-only batches.",
-                            exc,
-                        )
-                        warned_missing_success_batch = True
-
-            batch_human = (
-                next(online_iterator)
-                if offline_batch_size == online_batch_size
-                else replay_buffer.sample(offline_batch_size)
-            )
-            return concatenate_batch_transitions(
-                left_batch_transitions=batch, right_batch_transition=batch_human
+        if offline_replay_buffer is not None and offline_iterator is None:
+            offline_iterator = offline_replay_buffer.get_iterator(
+                batch_size=batch_size, async_prefetch=async_prefetch, queue_size=2
             )
 
         time_for_one_optimization_step = time.time()
         for _ in range(utd_ratio - 1):
-            batch = _sample_hilserl_batch()
+            # Sample from the iterators
+            batch = next(online_iterator)
+
+            if dataset_repo_id is not None:
+                batch_offline = next(offline_iterator)
+                batch = concatenate_batch_transitions(
+                    left_batch_transitions=batch, right_batch_transition=batch_offline
+                )
 
             actions = batch[ACTION]
             rewards = batch["reward"]
@@ -553,7 +451,13 @@ def add_actor_information_and_train(
             policy.update_target_networks()
 
         # Sample for the last update in the UTD ratio
-        batch = _sample_hilserl_batch()
+        batch = next(online_iterator)
+
+        if dataset_repo_id is not None:
+            batch_offline = next(offline_iterator)
+            batch = concatenate_batch_transitions(
+                left_batch_transitions=batch, right_batch_transition=batch_offline
+            )
 
         actions = batch[ACTION]
         rewards = batch["reward"]
@@ -576,7 +480,6 @@ def add_actor_information_and_train(
             "done": done,
             "observation_feature": observation_features,
             "next_observation_feature": next_observation_features,
-            "complementary_info": batch.get("complementary_info"),
         }
 
         critic_output = policy.forward(forward_batch, model="critic")
@@ -594,15 +497,6 @@ def add_actor_information_and_train(
             "loss_critic": loss_critic.item(),
             "critic_grad_norm": critic_grad_norm,
         }
-        batch_reward_mean: float | None = None
-        batch_reward_max: float | None = None
-        try:
-            batch_reward_mean = float(rewards.mean().item())
-            batch_reward_max = float(rewards.max().item())
-            training_infos["batch_reward_mean"] = batch_reward_mean
-            training_infos["batch_reward_max"] = batch_reward_max
-        except Exception:
-            pass
 
         # Discrete critic optimization (if available)
         if policy.config.num_discrete_actions is not None:
@@ -620,75 +514,39 @@ def add_actor_information_and_train(
             training_infos["discrete_critic_grad_norm"] = discrete_critic_grad_norm
 
         # Actor and temperature optimization (at specified frequency)
-        actor_updates_allowed = True
-        min_positive = int(getattr(cfg.policy, "min_positive_reward_transitions_before_actor_update", 0) or 0)
-        positive_reward_transitions: int | None = None
-        skip_no_positive_in_batch = False
-        skip_insufficient_positive_transitions = False
-        if min_positive > 0:
-            try:
-                rewards_buf = replay_buffer.rewards[: len(replay_buffer)]
-                positive_reward_transitions = int((rewards_buf > 0).sum().item())
-                if success_replay_buffer is not None and len(success_replay_buffer) > 0:
-                    try:
-                        rewards_success = success_replay_buffer.rewards[: len(success_replay_buffer)]
-                        positive_reward_transitions += int((rewards_success > 0).sum().item())
-                    except Exception:
-                        pass
-                if positive_reward_transitions < min_positive:
-                    actor_updates_allowed = False
-                    skip_insufficient_positive_transitions = True
-            except Exception:
-                # Best-effort: if we fail to compute the gate, default to preserving existing behavior.
-                actor_updates_allowed = True
-                positive_reward_transitions = None
-            # Extra safety for sparse-reward HIL: don't update the actor on batches that contain
-            # no positive rewards yet (critic is typically uninformative early on).
-            if batch_reward_max is not None and batch_reward_max <= 0.0:
-                actor_updates_allowed = False
-                skip_no_positive_in_batch = True
-            if positive_reward_transitions is not None:
-                training_infos["positive_reward_transitions"] = positive_reward_transitions
+        if optimization_step % policy_update_freq == 0:
+            for _ in range(policy_update_freq):
+                # Actor optimization
+                actor_output = policy.forward(forward_batch, model="actor")
+                loss_actor = actor_output["loss_actor"]
+                optimizers["actor"].zero_grad()
+                loss_actor.backward()
+                actor_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    parameters=policy.actor.parameters(), max_norm=clip_grad_norm_value
+                ).item()
+                optimizers["actor"].step()
 
-        if actor_updates_allowed and optimization_step % policy_update_freq == 0:
-            # Actor optimization (optionally less frequent than critic updates).
-            actor_output = policy.forward(forward_batch, model="actor")
-            loss_actor = actor_output["loss_actor"]
-            optimizers["actor"].zero_grad()
-            loss_actor.backward()
-            actor_grad_norm = torch.nn.utils.clip_grad_norm_(
-                parameters=policy.actor.parameters(), max_norm=clip_grad_norm_value
-            ).item()
-            optimizers["actor"].step()
+                # Add actor info to training info
+                training_infos["loss_actor"] = loss_actor.item()
+                training_infos["actor_grad_norm"] = actor_grad_norm
 
-            # Add actor info to training info
-            training_infos["loss_actor"] = loss_actor.item()
-            training_infos["actor_grad_norm"] = actor_grad_norm
+                # Temperature optimization
+                temperature_output = policy.forward(forward_batch, model="temperature")
+                loss_temperature = temperature_output["loss_temperature"]
+                optimizers["temperature"].zero_grad()
+                loss_temperature.backward()
+                temp_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    parameters=[policy.log_alpha], max_norm=clip_grad_norm_value
+                ).item()
+                optimizers["temperature"].step()
 
-            # Temperature optimization
-            temperature_output = policy.forward(forward_batch, model="temperature")
-            loss_temperature = temperature_output["loss_temperature"]
-            optimizers["temperature"].zero_grad()
-            loss_temperature.backward()
-            temp_grad_norm = torch.nn.utils.clip_grad_norm_(
-                parameters=[policy.log_alpha], max_norm=clip_grad_norm_value
-            ).item()
-            optimizers["temperature"].step()
+                # Add temperature info to training info
+                training_infos["loss_temperature"] = loss_temperature.item()
+                training_infos["temperature_grad_norm"] = temp_grad_norm
+                training_infos["temperature"] = policy.temperature
 
-            # Add temperature info to training info
-            training_infos["loss_temperature"] = loss_temperature.item()
-            training_infos["temperature_grad_norm"] = temp_grad_norm
-            training_infos["temperature"] = policy.temperature
-
-            # Update temperature
-            policy.update_temperature()
-        elif not actor_updates_allowed:
-            # Avoid drifting a pretrained actor when the reward signal is absent (common in sparse-reward HIL setups).
-            training_infos["actor_updates_skipped"] = 1
-            if skip_no_positive_in_batch:
-                training_infos["actor_updates_skipped_no_positive_in_batch"] = 1
-            if skip_insufficient_positive_transitions:
-                training_infos["actor_updates_skipped_insufficient_positive_reward_transitions"] = 1
+                # Update temperature
+                policy.update_temperature()
 
         # Push policy to actors if needed
         if time.time() - last_time_policy_pushed > policy_parameters_push_frequency:
@@ -703,38 +561,11 @@ def add_actor_information_and_train(
             training_infos["replay_buffer_size"] = len(replay_buffer)
             if offline_replay_buffer is not None:
                 training_infos["offline_replay_buffer_size"] = len(offline_replay_buffer)
-            if success_replay_buffer is not None:
-                training_infos["success_replay_buffer_size"] = len(success_replay_buffer)
             training_infos["Optimization step"] = optimization_step
-            # Log max_relative_target constraint diagnostics (if enabled in the SAC config).
-            try:
-                stats_actor = getattr(policy, "_last_max_relative_target_stats_actor", None)
-                if isinstance(stats_actor, dict):
-                    for key, value in stats_actor.items():
-                        if isinstance(value, torch.Tensor) and value.numel() == 1:
-                            training_infos[f"actor_{key}"] = float(value.item())
-                stats_critic = getattr(policy, "_last_max_relative_target_stats_critic", None)
-                if isinstance(stats_critic, dict):
-                    for key, value in stats_critic.items():
-                        if isinstance(value, torch.Tensor) and value.numel() == 1:
-                            training_infos[f"critic_{key}"] = float(value.item())
-            except Exception:
-                pass
-            # Log SAC-ACT residual policy diagnostics (if enabled).
-            try:
-                residual_stats = getattr(policy, "_last_act_residual_stats", None)
-                if isinstance(residual_stats, dict):
-                    for key, value in residual_stats.items():
-                        if isinstance(value, torch.Tensor) and value.numel() == 1:
-                            training_infos[f"actor_{key}"] = float(value.item())
-            except Exception:
-                pass
 
             # Log training metrics
             if wandb_logger:
                 wandb_logger.log_dict(d=training_infos, mode="train", custom_step_key="Optimization step")
-            else:
-                logging.info("[LEARNER] Training metrics: %s", training_infos)
 
         # Calculate and log optimization frequency
         time_for_one_optimization_step = time.time() - time_for_one_optimization_step
@@ -771,35 +602,6 @@ def add_actor_information_and_train(
                 dataset_repo_id=dataset_repo_id,
                 fps=fps,
             )
-
-    # If we are stopping (Ctrl-C / shutdown), try to save a final checkpoint so the user can resume
-    # or inspect the latest weights even if `save_freq` was not reached.
-    if saving_checkpoint and replay_buffer is not None and len(replay_buffer) > 0:
-        has_existing_checkpoint = os.path.exists(
-            os.path.join(cfg.output_dir, CHECKPOINTS_DIR, LAST_CHECKPOINT_LINK)
-        )
-        if (not has_existing_checkpoint) or (
-            optimization_step % save_freq != 0 and optimization_step != online_steps
-        ):
-            try:
-                logging.info(
-                    "[LEARNER] Saving final checkpoint on shutdown at optimization_step=%s",
-                    optimization_step,
-                )
-                save_training_checkpoint(
-                    cfg=cfg,
-                    optimization_step=optimization_step,
-                    online_steps=online_steps,
-                    interaction_message=interaction_message,
-                    policy=policy,
-                    optimizers=optimizers,
-                    replay_buffer=replay_buffer,
-                    offline_replay_buffer=offline_replay_buffer,
-                    dataset_repo_id=dataset_repo_id,
-                    fps=fps,
-                )
-            except Exception:
-                logging.exception("[LEARNER] Failed to save final checkpoint on shutdown.")
 
 
 def start_learner(
@@ -933,33 +735,27 @@ def save_training_checkpoint(
     # Update the "last" symlink
     update_last_checkpoint(checkpoint_dir)
 
-    # Optional: export replay buffers as LeRobot datasets.
-    # This is useful for debugging, but can be very slow on real robots (large images) and stall the
-    # learner for minutes, which may destabilize the control loop. Keep it opt-in.
-    if getattr(cfg, "save_replay_buffer_dataset", False):
-        dataset_dir = os.path.join(cfg.output_dir, "dataset")
-        if os.path.exists(dataset_dir) and os.path.isdir(dataset_dir):
-            shutil.rmtree(dataset_dir)
+    # TODO : temporary save replay buffer here, remove later when on the robot
+    # We want to control this with the keyboard inputs
+    dataset_dir = os.path.join(cfg.output_dir, "dataset")
+    if os.path.exists(dataset_dir) and os.path.isdir(dataset_dir):
+        shutil.rmtree(dataset_dir)
 
-        # Save dataset
-        # NOTE: Handle the case where the dataset repo id is not specified in the config
-        # eg. RL training without demonstrations data
-        repo_id_buffer_save = dataset_repo_id or cfg.env.task or str(cfg.job_name) or "hilserl_buffer"
-        replay_buffer.to_lerobot_dataset(repo_id=repo_id_buffer_save, fps=fps, root=dataset_dir)
+    # Save dataset
+    # NOTE: Handle the case where the dataset repo id is not specified in the config
+    # eg. RL training without demonstrations data
+    repo_id_buffer_save = cfg.env.task if dataset_repo_id is None else dataset_repo_id
+    replay_buffer.to_lerobot_dataset(repo_id=repo_id_buffer_save, fps=fps, root=dataset_dir)
 
-        if offline_replay_buffer is not None and len(offline_replay_buffer) > 0:
-            dataset_offline_dir = os.path.join(cfg.output_dir, "dataset_offline")
-            if os.path.exists(dataset_offline_dir) and os.path.isdir(dataset_offline_dir):
-                shutil.rmtree(dataset_offline_dir)
+    if offline_replay_buffer is not None:
+        dataset_offline_dir = os.path.join(cfg.output_dir, "dataset_offline")
+        if os.path.exists(dataset_offline_dir) and os.path.isdir(dataset_offline_dir):
+            shutil.rmtree(dataset_offline_dir)
 
-            offline_replay_buffer.to_lerobot_dataset(
-                dataset_repo_id or repo_id_buffer_save,
-                fps=fps,
-                root=dataset_offline_dir,
-            )
-    else:
-        logging.info(
-            "[LEARNER] Skipping replay buffer dataset export (save_replay_buffer_dataset=false)."
+        offline_replay_buffer.to_lerobot_dataset(
+            cfg.dataset.repo_id,
+            fps=fps,
+            root=dataset_offline_dir,
         )
 
     logging.info("Resume training")
@@ -991,34 +787,21 @@ def make_optimizers_and_scheduler(cfg: TrainRLServerPipelineConfig, policy: nn.M
         - `lr_scheduler`: Currently set to `None` but can be extended to support learning rate scheduling.
 
     """
-    actor_named_params = [
-        (n, p)
-        for n, p in policy.actor.named_parameters()
-        if (not policy.config.shared_encoder or not n.startswith("encoder")) and p.requires_grad
-    ]
-    if getattr(cfg.policy, "type", None) == "sac_act":
-        lr_scale = float(getattr(cfg.policy, "act_finetune_lr_scale", 0.1))
-        lr_scale = max(lr_scale, 0.0)
-        act_policy_params = [p for n, p in actor_named_params if n.startswith("act_policy.")]
-        other_actor_params = [p for n, p in actor_named_params if not n.startswith("act_policy.")]
-
-        actor_param_groups = []
-        if act_policy_params:
-            actor_param_groups.append(
-                {"params": act_policy_params, "lr": cfg.policy.actor_lr * lr_scale}
-            )
-        if other_actor_params:
-            actor_param_groups.append({"params": other_actor_params, "lr": cfg.policy.actor_lr})
-        optimizer_actor = torch.optim.Adam(params=actor_param_groups)
-    else:
-        optimizer_actor = torch.optim.Adam(params=[p for _, p in actor_named_params], lr=cfg.policy.actor_lr)
+    optimizer_actor = torch.optim.Adam(
+        params=[
+            p
+            for n, p in policy.actor.named_parameters()
+            if not policy.config.shared_encoder or not n.startswith("encoder")
+        ],
+        lr=cfg.policy.actor_lr,
+    )
     optimizer_critic = torch.optim.Adam(params=policy.critic_ensemble.parameters(), lr=cfg.policy.critic_lr)
 
     if cfg.policy.num_discrete_actions is not None:
         optimizer_discrete_critic = torch.optim.Adam(
             params=policy.discrete_critic.parameters(), lr=cfg.policy.critic_lr
         )
-    optimizer_temperature = torch.optim.Adam(params=[policy.log_alpha], lr=cfg.policy.temperature_lr)
+    optimizer_temperature = torch.optim.Adam(params=[policy.log_alpha], lr=cfg.policy.critic_lr)
     lr_scheduler = None
     optimizers = {
         "actor": optimizer_actor,
@@ -1082,19 +865,11 @@ def handle_resume_logic(cfg: TrainRLServerPipelineConfig) -> TrainRLServerPipeli
     )
 
     # Load config using Draccus
-    checkpoint_cfg_path = Path(checkpoint_dir) / PRETRAINED_MODEL_DIR / "train_config.json"
+    checkpoint_cfg_path = os.path.join(checkpoint_dir, PRETRAINED_MODEL_DIR, "train_config.json")
     checkpoint_cfg = TrainRLServerPipelineConfig.from_pretrained(checkpoint_cfg_path)
 
-    # Ensure resume flag is set in returned config.
+    # Ensure resume flag is set in returned config
     checkpoint_cfg.resume = True
-
-    # Keep the output dir used for resume detection (important if the checkpoint config stored a relative path).
-    checkpoint_cfg.output_dir = Path(out_dir)
-
-    # Ensure the policy is initialized from the latest checkpoint weights.
-    # `make_policy(...)` loads weights only when `policy.pretrained_path` is set.
-    if checkpoint_cfg.policy is not None:
-        checkpoint_cfg.policy.pretrained_path = checkpoint_cfg_path.parent
     return checkpoint_cfg
 
 
@@ -1206,11 +981,7 @@ def initialize_offline_replay_buffer(
     storage_device: str,
 ) -> ReplayBuffer:
     """
-    Initialize the HIL-SERL "human" replay buffer.
-
-    This buffer is used to over-sample human-provided data during training:
-    - offline demonstrations (if `cfg.dataset` is provided)
-    - online human interventions (streamed from the actor)
+    Initialize an offline replay buffer from a dataset.
 
     Args:
         cfg (TrainRLServerPipelineConfig): Training configuration
@@ -1220,16 +991,6 @@ def initialize_offline_replay_buffer(
     Returns:
         ReplayBuffer: Initialized offline replay buffer
     """
-    if cfg.dataset is None:
-        logging.info("No offline dataset configured; initializing empty human replay buffer.")
-        return ReplayBuffer(
-            capacity=cfg.policy.offline_buffer_capacity,
-            device=device,
-            state_keys=cfg.policy.input_features.keys(),
-            storage_device=storage_device,
-            optimize_memory=True,
-        )
-
     if not cfg.resume:
         logging.info("make_dataset offline buffer")
         offline_dataset = make_dataset(cfg)
@@ -1242,16 +1003,15 @@ def initialize_offline_replay_buffer(
         )
 
     logging.info("Convert to a offline replay buffer")
-    capacity = max(cfg.policy.offline_buffer_capacity, len(offline_dataset))
-    return ReplayBuffer.from_lerobot_dataset(
-        lerobot_dataset=offline_dataset,
+    offline_replay_buffer = ReplayBuffer.from_lerobot_dataset(
+        offline_dataset,
         device=device,
         state_keys=cfg.policy.input_features.keys(),
         storage_device=storage_device,
         optimize_memory=True,
-        capacity=capacity,
-        extra_complementary_info={TeleopEvents.IS_INTERVENTION.value: torch.tensor([1.0])},
+        capacity=cfg.policy.offline_buffer_capacity,
     )
+    return offline_replay_buffer
 
 
 # Utilities/Helpers functions
@@ -1310,7 +1070,7 @@ def check_nan_in_transition(
 
     # Check observations
     for key, tensor in observations.items():
-        if tensor.is_floating_point() and torch.isnan(tensor).any():
+        if torch.isnan(tensor).any():
             logging.error(f"observations[{key}] contains NaN values")
             nan_detected = True
             if raise_error:
@@ -1318,14 +1078,14 @@ def check_nan_in_transition(
 
     # Check next state
     for key, tensor in next_state.items():
-        if tensor.is_floating_point() and torch.isnan(tensor).any():
+        if torch.isnan(tensor).any():
             logging.error(f"next_state[{key}] contains NaN values")
             nan_detected = True
             if raise_error:
                 raise ValueError(f"NaN detected in next_state[{key}]")
 
     # Check actions
-    if actions.is_floating_point() and torch.isnan(actions).any():
+    if torch.isnan(actions).any():
         logging.error("actions contains NaN values")
         nan_detected = True
         if raise_error:
@@ -1348,24 +1108,7 @@ def push_actor_policy_to_queue(parameters_queue: Queue, policy: nn.Module):
         logging.debug("[LEARNER] Including discrete critic in state dict push")
 
     state_bytes = state_to_bytes(state_dicts)
-    try:
-        parameters_queue.put(state_bytes, block=False)
-        return
-    except Exception:  # noqa: BLE001
-        # Queue is likely full; drop stale params and retry (best-effort).
-        try:
-            _ = parameters_queue.get_nowait()
-        except QueueEmpty:
-            pass
-        except Exception:  # noqa: BLE001
-            pass
-
-    try:
-        parameters_queue.put(state_bytes, block=False)
-    except QueueFull:
-        logging.debug("[LEARNER] Parameters queue full; dropping policy push.")
-    except Exception:  # noqa: BLE001
-        logging.exception("[LEARNER] Failed to push policy parameters to queue.")
+    parameters_queue.put(state_bytes)
 
 
 def process_interaction_message(
@@ -1386,145 +1129,27 @@ def process_interaction_message(
 def process_transitions(
     transition_queue: Queue,
     replay_buffer: ReplayBuffer,
-    offline_replay_buffer: ReplayBuffer | None,
-    success_replay_buffer: ReplayBuffer | None,
+    offline_replay_buffer: ReplayBuffer,
     device: str,
-    prev_intervention: bool,
+    dataset_repo_id: str | None,
     shutdown_event: any,
-    *,
-    success_tail_steps: int = 0,
-    success_tail_reward: float | None = None,
-) -> bool:
+):
     """Process all available transitions from the queue.
 
     Args:
         transition_queue: Queue for receiving transitions from the actor
         replay_buffer: Replay buffer to add transitions to
-        offline_replay_buffer: Offline (human) replay buffer to add transitions to
+        offline_replay_buffer: Offline replay buffer to add transitions to
         device: Device to move transitions to
-        prev_intervention: Whether the previous transition was an intervention (state carried across calls)
+        dataset_repo_id: Repository ID for dataset
         shutdown_event: Event to signal shutdown
-
-    Returns:
-        bool: Updated `prev_intervention` flag for the next call.
     """
-    def _as_bool(value: object) -> bool:
-        if isinstance(value, torch.Tensor):
-            if value.numel() != 1:
-                return False
-            return bool(value.item())
-        return bool(value)
-
-    def _as_float(value: object) -> float:
-        if isinstance(value, torch.Tensor):
-            if value.numel() == 1:
-                return float(value.item())
-            return float(value.float().mean().item())
-        try:
-            return float(value)  # type: ignore[arg-type]
-        except Exception:
-            return 0.0
-
-    def _get_last_inserted_idx(buf: ReplayBuffer) -> int:
-        return (buf.position - 1) % buf.capacity
-
-    def _success_tail_indices(buf: ReplayBuffer, terminal_idx: int, tail_steps: int) -> list[int]:
-        if tail_steps <= 0:
-            return []
-
-        indices_rev: list[int] = []
-        full = buf.size >= buf.capacity
-
-        for back in range(tail_steps):
-            if full:
-                idx = (terminal_idx - back) % buf.capacity
-            else:
-                idx = terminal_idx - back
-                if idx < 0:
-                    break
-
-            # Stop when we cross an episode boundary (exclude the previous episode's terminal).
-            if back > 0 and _as_bool(buf.episode_ends[idx]):
-                break
-
-            indices_rev.append(idx)
-
-        return list(reversed(indices_rev))
-
-    def _apply_success_tail_reward_shaping(
-        buf: ReplayBuffer,
-        tail_indices: list[int],
-        terminal_reward: float,
-        *,
-        tail_steps_cfg: int,
-        tail_reward_cfg: float | None,
-    ) -> None:
-        if tail_steps_cfg <= 0 or len(tail_indices) <= 1:
-            return
-
-        # `tail_indices` is chronological and includes the terminal transition as its last element.
-        # We only assign shaping reward to the non-terminal tail transitions.
-        if tail_reward_cfg is None:
-            per_step_reward = terminal_reward / float(tail_steps_cfg)
-        else:
-            per_step_reward = float(tail_reward_cfg)
-
-        if per_step_reward <= 0.0:
-            return
-
-        for idx in tail_indices[:-1]:
-            try:
-                existing = float(buf.rewards[idx].item())
-            except Exception:
-                existing = 0.0
-            if existing < per_step_reward:
-                buf.rewards[idx] = float(per_step_reward)
-
-    def _copy_tail_to_success_buffer(
-        src: ReplayBuffer,
-        dst: ReplayBuffer,
-        tail_indices: list[int],
-    ) -> None:
-        if not tail_indices:
-            return
-
-        for idx in tail_indices:
-            state = {k: src.states[k][idx].unsqueeze(0) for k in src.states}
-            action = src.actions[idx].unsqueeze(0)
-            reward = float(src.rewards[idx].item())
-            done = bool(src.dones[idx].item())
-            truncated = bool(src.truncateds[idx].item())
-
-            complementary_info = None
-            if src.has_complementary_info:
-                complementary_info = {}
-                for key in src.complementary_info_keys:
-                    val = src.complementary_info[key][idx]
-                    if isinstance(val, torch.Tensor):
-                        complementary_info[key] = val.unsqueeze(0) if val.ndim > 0 else val.view(1)
-                    elif isinstance(val, (int, float, bool)):
-                        complementary_info[key] = torch.tensor([val], device=src.storage_device)
-
-            dst.add(
-                state=state,
-                action=action,
-                reward=reward,
-                next_state={},
-                done=done,
-                truncated=truncated,
-                complementary_info=complementary_info,
-            )
-
     while not transition_queue.empty() and not shutdown_event.is_set():
         transition_list = transition_queue.get()
         transition_list = bytes_to_transitions(buffer=transition_list)
 
         for transition in transition_list:
-            # Store transitions on the replay buffer storage device (typically CPU) to avoid GPU OOM and
-            # unnecessary device transfers. Sampling will move batches to the training device.
-            transition = move_transition_to_device(
-                transition=transition, device=getattr(replay_buffer, "storage_device", device)
-            )
+            transition = move_transition_to_device(transition=transition, device=device)
 
             # Skip transitions with NaN values
             if check_nan_in_transition(
@@ -1537,48 +1162,11 @@ def process_transitions(
 
             replay_buffer.add(**transition)
 
-            # Sparse success-label shaping: spread a small positive reward to the last N transitions of a
-            # successful episode, and optionally store them in a dedicated success buffer.
-            if success_tail_steps > 0:
-                terminal_reward = _as_float(transition.get("reward", 0.0))
-                is_terminal = _as_bool(transition.get("done", False)) or _as_bool(
-                    transition.get("truncated", False)
-                )
-                if is_terminal and terminal_reward > 0.0:
-                    terminal_idx = _get_last_inserted_idx(replay_buffer)
-                    tail_indices = _success_tail_indices(replay_buffer, terminal_idx, success_tail_steps)
-                    _apply_success_tail_reward_shaping(
-                        replay_buffer,
-                        tail_indices,
-                        terminal_reward,
-                        tail_steps_cfg=success_tail_steps,
-                        tail_reward_cfg=success_tail_reward,
-                    )
-                    if success_replay_buffer is not None:
-                        _copy_tail_to_success_buffer(replay_buffer, success_replay_buffer, tail_indices)
-
-            # HIL-SERL "human buffer" logic:
-            # - Insert intervention transitions.
-            # - Also insert the first non-intervention transition right after an intervention segment,
-            #   so the last intervention transition has a correct next_state when using optimize_memory=True.
-            if offline_replay_buffer is not None:
-                complementary_info = transition.get("complementary_info") or {}
-                is_intervention = complementary_info.get(TeleopEvents.IS_INTERVENTION)
-                if is_intervention is None:
-                    is_intervention = complementary_info.get(TeleopEvents.IS_INTERVENTION.value)
-                is_intervention_b = _as_bool(is_intervention)
-
-                if is_intervention_b:
-                    offline_replay_buffer.add(**transition)
-                    prev_intervention = True
-                elif prev_intervention:
-                    offline_replay_buffer.add(**transition)
-                    prev_intervention = False
-
-                if _as_bool(transition.get("done", False)) or _as_bool(transition.get("truncated", False)):
-                    prev_intervention = False
-
-    return prev_intervention
+            # Add to offline buffer if it's an intervention
+            if dataset_repo_id is not None and transition.get("complementary_info", {}).get(
+                TeleopEvents.IS_INTERVENTION
+            ):
+                offline_replay_buffer.add(**transition)
 
 
 def process_interaction_messages(

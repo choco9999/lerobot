@@ -45,15 +45,8 @@ When implementing a new policy class (e.g. `DiffusionPolicy`) follow these steps
 """
 
 import itertools
-import sys
 
-# Support running from source without installing the package (e.g. `python -m src.lerobot...`).
-# In that case, expose the package under its canonical import name (`lerobot`) so that
-# absolute imports like `from lerobot.xyz import ...` work as expected.
-if __name__.startswith("src."):
-    sys.modules.setdefault("lerobot", sys.modules[__name__])
-
-from .__version__ import __version__  # noqa: F401
+from lerobot.__version__ import __version__  # noqa: F401
 
 # TODO(rcadene): Improve policies and envs. As of now, an item in `available_policies`
 # refers to a yaml file AND a modeling name. Same for `available_envs` which refers to

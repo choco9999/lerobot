@@ -44,7 +44,7 @@ def init_rerun(
 
 
 def _is_scalar(x):
-    return isinstance(x, (float, numbers.Real, np.integer, np.floating)) or (
+    return isinstance(x, (float | numbers.Real | np.integer | np.floating)) or (
         isinstance(x, np.ndarray) and x.ndim == 0
     )
 

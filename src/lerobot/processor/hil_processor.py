@@ -15,7 +15,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
 import math
 import time
 from dataclasses import dataclass
@@ -42,27 +41,6 @@ from .pipeline import (
 GRIPPER_KEY = "gripper"
 DISCRETE_PENALTY_KEY = "discrete_penalty"
 TELEOP_ACTION_KEY = "teleop_action"
-
-_MINMAX_EPS = 1e-8
-logger = logging.getLogger(__name__)
-
-
-def _squeeze_batch_dim_if_present(tensor: torch.Tensor) -> torch.Tensor:
-    if tensor.ndim > 1 and tensor.shape[0] == 1:
-        return tensor.squeeze(0)
-    return tensor
-
-
-def _minmax_normalize(x: torch.Tensor, min_val: torch.Tensor, max_val: torch.Tensor) -> torch.Tensor:
-    denom = max_val - min_val
-    denom = torch.where(denom == 0, torch.full_like(denom, _MINMAX_EPS), denom)
-    return 2 * (x - min_val) / denom - 1
-
-
-def _minmax_unnormalize(x: torch.Tensor, min_val: torch.Tensor, max_val: torch.Tensor) -> torch.Tensor:
-    denom = max_val - min_val
-    denom = torch.where(denom == 0, torch.full_like(denom, _MINMAX_EPS), denom)
-    return (x + 1) / 2 * denom + min_val
 
 
 @runtime_checkable
@@ -139,34 +117,7 @@ class AddTeleopActionAsComplimentaryDataStep(ComplementaryDataProcessorStep):
             `teleop_action` key.
         """
         new_complementary_data = dict(complementary_data)
-        info = {}
-        if hasattr(self, "_current_transition"):
-            maybe_info = self._current_transition.get(TransitionKey.INFO, {})
-            if isinstance(maybe_info, dict):
-                info = maybe_info
-
-        has_intervention_flag = (
-            TeleopEvents.IS_INTERVENTION in info or TeleopEvents.IS_INTERVENTION.value in info
-        )
-        is_intervention = True
-        if has_intervention_flag:
-            is_intervention = bool(
-                info.get(TeleopEvents.IS_INTERVENTION, False)
-                or info.get(TeleopEvents.IS_INTERVENTION.value, False)
-            )
-
-        if not is_intervention:
-            new_complementary_data[TELEOP_ACTION_KEY] = None
-            return new_complementary_data
-
-        try:
-            new_complementary_data[TELEOP_ACTION_KEY] = self.teleop_device.get_action()
-        except Exception as e:  # noqa: BLE001
-            logger.warning(
-                "Failed to read teleop action (%s); intervention will fall back to holding the current pose.",
-                e,
-            )
-            new_complementary_data[TELEOP_ACTION_KEY] = None
+        new_complementary_data[TELEOP_ACTION_KEY] = self.teleop_device.get_action()
         return new_complementary_data
 
     def transform_features(
@@ -457,9 +408,6 @@ class InterventionActionProcessorStep(ProcessorStep):
 
     use_gripper: bool = False
     terminate_on_success: bool = True
-    action_min: list[float] | None = None
-    action_max: list[float] | None = None
-    normalize_teleop_action: bool = False
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         """
@@ -479,7 +427,7 @@ class InterventionActionProcessorStep(ProcessorStep):
         # Get intervention signals from complementary data
         info = transition.get(TransitionKey.INFO, {})
         complementary_data = transition.get(TransitionKey.COMPLEMENTARY_DATA, {})
-        teleop_action = complementary_data.get(TELEOP_ACTION_KEY)
+        teleop_action = complementary_data.get(TELEOP_ACTION_KEY, {})
         is_intervention = info.get(TeleopEvents.IS_INTERVENTION, False)
         terminate_episode = info.get(TeleopEvents.TERMINATE_EPISODE, False)
         success = info.get(TeleopEvents.SUCCESS, False)
@@ -487,74 +435,23 @@ class InterventionActionProcessorStep(ProcessorStep):
 
         new_transition = transition.copy()
 
-        # Override action if intervention is active. If the teleop action cannot be read, fall back
-        # to holding the current pose (derived from the raw joint positions injected into the
-        # transition observation by the control loop).
-        action_source = "policy"
-        if is_intervention:
-            if teleop_action is None:
-                obs = transition.get(TransitionKey.OBSERVATION, {})
-                if isinstance(obs, dict):
-                    hold_action = {
-                        k: v for k, v in obs.items() if isinstance(k, str) and k.endswith(".pos")
-                    }
-                    teleop_action = hold_action if hold_action else None
-                action_source = "hold" if teleop_action is not None else "none"
-            else:
-                action_source = "teleop"
-
+        # Override action if intervention is active
         if is_intervention and teleop_action is not None:
-            teleop_action_tensor: torch.Tensor
-            if isinstance(teleop_action, torch.Tensor):
-                teleop_action_tensor = teleop_action.to(device=action.device, dtype=action.dtype)
+            if isinstance(teleop_action, dict):
+                # Convert teleop_action dict to tensor format
+                action_list = [
+                    teleop_action.get("delta_x", 0.0),
+                    teleop_action.get("delta_y", 0.0),
+                    teleop_action.get("delta_z", 0.0),
+                ]
+                if self.use_gripper:
+                    action_list.append(teleop_action.get(GRIPPER_KEY, 1.0))
             elif isinstance(teleop_action, np.ndarray):
-                teleop_action_tensor = torch.from_numpy(teleop_action).to(
-                    device=action.device, dtype=action.dtype
-                )
-            elif isinstance(teleop_action, dict):
-                if {"delta_x", "delta_y", "delta_z"}.issubset(teleop_action):
-                    # End-effector delta control.
-                    action_list = [
-                        teleop_action.get("delta_x", 0.0),
-                        teleop_action.get("delta_y", 0.0),
-                        teleop_action.get("delta_z", 0.0),
-                    ]
-                    if self.use_gripper:
-                        action_list.append(teleop_action.get(GRIPPER_KEY, 1.0))
-                else:
-                    # Joint-space control: expect keys like "{joint}.pos".
-                    obs = transition.get(TransitionKey.OBSERVATION, {})
-                    obs_keys = []
-                    if isinstance(obs, dict):
-                        obs_keys = [
-                            k
-                            for k in obs
-                            if isinstance(k, str) and k.endswith(".pos") and k in teleop_action
-                        ]
-
-                    joint_keys = obs_keys if obs_keys else sorted(
-                        [k for k in teleop_action if isinstance(k, str) and k.endswith(".pos")]
-                    )
-                    action_list = [teleop_action[k] for k in joint_keys]
-
-                teleop_action_tensor = torch.tensor(action_list, dtype=action.dtype, device=action.device)
+                action_list = teleop_action.tolist()
             else:
-                teleop_action_tensor = torch.tensor(teleop_action, dtype=action.dtype, device=action.device)
+                action_list = teleop_action
 
-            teleop_action_tensor = _squeeze_batch_dim_if_present(teleop_action_tensor)
-
-            if self.normalize_teleop_action and self.action_min is not None and self.action_max is not None:
-                action_min = torch.tensor(self.action_min, dtype=action.dtype, device=action.device)
-                action_max = torch.tensor(self.action_max, dtype=action.dtype, device=action.device)
-                if teleop_action_tensor.numel() != action_min.numel():
-                    raise ValueError(
-                        f"Teleop action dim mismatch: got {teleop_action_tensor.numel()} values, "
-                        f"but action_min/action_max have {action_min.numel()} values."
-                    )
-                teleop_action_tensor = _minmax_normalize(teleop_action_tensor, action_min, action_max).clamp(
-                    -1.0, 1.0
-                )
-
+            teleop_action_tensor = torch.tensor(action_list, dtype=action.dtype, device=action.device)
             new_transition[TransitionKey.ACTION] = teleop_action_tensor
 
         # Handle episode termination
@@ -565,8 +462,6 @@ class InterventionActionProcessorStep(ProcessorStep):
 
         # Update info with intervention metadata
         info = new_transition.get(TransitionKey.INFO, {})
-        if isinstance(info, dict):
-            info["_intervention_action_source"] = action_source
         info[TeleopEvents.IS_INTERVENTION] = is_intervention
         info[TeleopEvents.RERECORD_EPISODE] = rerecord_episode
         info[TeleopEvents.SUCCESS] = success
@@ -694,205 +589,6 @@ class RewardClassifierProcessorStep(ProcessorStep):
             "success_reward": self.success_reward,
             "terminate_on_success": self.terminate_on_success,
         }
-
-    def transform_features(
-        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
-    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
-        return features
-
-
-@dataclass
-@ProcessorStepRegistry.register("finalize_hil_action_processor")
-class FinalizeHILActionProcessorStep(ProcessorStep):
-    """
-    Finalize the action field for env stepping and training.
-
-    - Squeezes a singleton batch dimension from the action if present.
-    - Sets `complementary_data['teleop_action']` to the (possibly overridden) action tensor.
-    """
-
-    def __call__(self, transition: EnvTransition) -> EnvTransition:
-        self._current_transition = transition.copy()
-        new_transition = self._current_transition
-
-        action = new_transition.get(TransitionKey.ACTION)
-        if isinstance(action, torch.Tensor):
-            action = _squeeze_batch_dim_if_present(action)
-            new_transition[TransitionKey.ACTION] = action
-
-        complementary_data = new_transition.get(TransitionKey.COMPLEMENTARY_DATA) or {}
-        complementary_data[TELEOP_ACTION_KEY] = action
-        new_transition[TransitionKey.COMPLEMENTARY_DATA] = complementary_data
-
-        return new_transition
-
-    def transform_features(
-        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
-    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
-        return features
-
-
-@dataclass
-@ProcessorStepRegistry.register("minmax_unnormalize_action_processor")
-class MinMaxUnnormalizeActionProcessorStep(ProcessorStep):
-    """Unnormalize a policy action from [-1, 1] to [min, max] using per-dimension bounds."""
-
-    action_min: list[float] | None = None
-    action_max: list[float] | None = None
-
-    def __call__(self, transition: EnvTransition) -> EnvTransition:
-        self._current_transition = transition.copy()
-        new_transition = self._current_transition
-
-        if self.action_min is None or self.action_max is None:
-            return new_transition
-
-        action = new_transition.get(TransitionKey.ACTION)
-        if not isinstance(action, torch.Tensor):
-            return new_transition
-
-        action = _squeeze_batch_dim_if_present(action)
-
-        action_min = torch.tensor(self.action_min, dtype=action.dtype, device=action.device)
-        action_max = torch.tensor(self.action_max, dtype=action.dtype, device=action.device)
-        if action.numel() != action_min.numel():
-            raise ValueError(
-                f"Action dim mismatch: got {action.numel()} values, but action_min/action_max have {action_min.numel()} values."
-            )
-
-        new_transition[TransitionKey.ACTION] = _minmax_unnormalize(action, action_min, action_max)
-        return new_transition
-
-    def transform_features(
-        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
-    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
-        return features
-
-
-@dataclass
-@ProcessorStepRegistry.register("max_relative_target_action_processor")
-class MaxRelativeTargetActionProcessorStep(ProcessorStep):
-    """Clamp absolute joint-target actions to be at most `max_relative_target` away from the present position.
-
-    This mirrors the safety clamp historically implemented inside robot drivers (e.g. SO101Follower),
-    but does it inside the action-processor pipeline so:
-      - the environment receives the same (clamped) command that we record for RL, and
-      - the robot driver becomes a pure IO layer (it can still keep its own clamp as a last resort).
-
-    Assumes `TransitionKey.ACTION` is already in *robot joint units* (i.e. after min/max unnormalization)
-    and that `TransitionKey.OBSERVATION` contains raw joint positions keyed by "{motor}.pos".
-    """
-
-    motor_names: list[str]
-    max_relative_target: float | dict[str, float] | None = None
-    action_min: list[float] | None = None
-    action_max: list[float] | None = None
-
-    def __post_init__(self) -> None:
-        if self.max_relative_target is None:
-            return
-        if isinstance(self.max_relative_target, dict):
-            motors = set(self.motor_names)
-            keys = set(self.max_relative_target)
-            unknown = sorted(keys - motors)
-            missing = sorted(motors - keys)
-            if unknown:
-                raise ValueError(
-                    "max_relative_target has unknown motors "
-                    f"{unknown}; expected keys={sorted(motors)}"
-                )
-            if missing:
-                raise ValueError(
-                    "max_relative_target is missing motors "
-                    f"{missing}; expected keys={sorted(motors)}"
-                )
-
-    def __call__(self, transition: EnvTransition) -> EnvTransition:
-        self._current_transition = transition.copy()
-        new_transition = self._current_transition
-
-        if self.max_relative_target is None:
-            return new_transition
-
-        action = new_transition.get(TransitionKey.ACTION)
-        if not isinstance(action, torch.Tensor):
-            return new_transition
-        action = _squeeze_batch_dim_if_present(action)
-        if action.ndim != 1:
-            action = action.reshape(-1)
-
-        obs = new_transition.get(TransitionKey.OBSERVATION, {})
-        if not isinstance(obs, dict):
-            return new_transition
-
-        present_vals: list[float] = []
-        for motor in self.motor_names:
-            key = f"{motor}.pos"
-            if key not in obs:
-                return new_transition
-            val = obs[key]
-            if isinstance(val, torch.Tensor):
-                if val.numel() != 1:
-                    return new_transition
-                present_vals.append(float(val.item()))
-            else:
-                present_vals.append(float(val))
-
-        present = torch.tensor(present_vals, dtype=action.dtype, device=action.device)
-        if action.numel() != present.numel():
-            return new_transition
-
-        info = new_transition.get(TransitionKey.INFO, {})
-        if not isinstance(info, dict):
-            info = {}
-        else:
-            info = dict(info)
-
-        if isinstance(self.max_relative_target, float):
-            max_diff = torch.full_like(action, float(self.max_relative_target))
-        else:
-            max_diff_vals = [float(self.max_relative_target[m]) for m in self.motor_names]
-            max_diff = torch.tensor(max_diff_vals, dtype=action.dtype, device=action.device)
-
-        diff = action - present
-        safe_diff = torch.minimum(diff, max_diff)
-        safe_diff = torch.maximum(safe_diff, -max_diff)
-        clamped_action = present + safe_diff
-
-        desired_delta_max = float(diff.abs().max().item())
-        applied_delta_max = float(safe_diff.abs().max().item())
-        clamp_amount_max = float((action - clamped_action).abs().max().item())
-
-        info["_max_relative_target_enabled"] = True
-        info["_max_relative_target_desired_delta_max"] = desired_delta_max
-        info["_max_relative_target_applied_delta_max"] = applied_delta_max
-        info["_max_relative_target_clamp_amount_max"] = clamp_amount_max
-
-        if torch.equal(clamped_action, action):
-            info["_max_relative_target_clamped"] = False
-            new_transition[TransitionKey.INFO] = info
-            return new_transition
-
-        info["_max_relative_target_clamped"] = True
-        new_transition[TransitionKey.INFO] = info
-        new_transition[TransitionKey.ACTION] = clamped_action
-
-        # Keep the action stored for RL aligned with the actual executed action.
-        if self.action_min is not None and self.action_max is not None:
-            try:
-                action_min = torch.tensor(self.action_min, dtype=clamped_action.dtype, device=clamped_action.device)
-                action_max = torch.tensor(self.action_max, dtype=clamped_action.dtype, device=clamped_action.device)
-                if clamped_action.numel() == action_min.numel():
-                    clamped_norm = _minmax_normalize(clamped_action, action_min, action_max).clamp(-1.0, 1.0)
-                    complementary_data = new_transition.get(TransitionKey.COMPLEMENTARY_DATA) or {}
-                    if not isinstance(complementary_data, dict):
-                        complementary_data = {}
-                    complementary_data[TELEOP_ACTION_KEY] = clamped_norm
-                    new_transition[TransitionKey.COMPLEMENTARY_DATA] = complementary_data
-            except Exception:  # noqa: BLE001
-                logger.debug("Failed to update teleop_action after max_relative_target clamp.", exc_info=True)
-
-        return new_transition
 
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]

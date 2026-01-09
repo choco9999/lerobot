@@ -64,7 +64,7 @@ pip install -e ".[hilserl]"
 
 The training process begins with proper configuration for the HILSerl environment. The main configuration class is `GymManipulatorConfig` in `lerobot/rl/gym_manipulator.py`, which contains nested `HILSerlRobotEnvConfig` and `DatasetConfig`. The configuration is organized into focused, nested sub-configs:
 
-{/* prettier-ignore-start */}
+<!-- prettier-ignore-start -->
 ```python
 class GymManipulatorConfig:
     env: HILSerlRobotEnvConfig    # Environment configuration (nested)
@@ -131,7 +131,7 @@ class DatasetConfig:
     replay_episode: int | None = None    # Episode index for replay
     push_to_hub: bool = False    # Whether to push datasets to Hub
 ```
-{/* prettier-ignore-end */}
+<!-- prettier-ignore-end -->
 
 ### Processor Pipeline Architecture
 
@@ -406,7 +406,7 @@ HIL-Serl learns actions in the end-effector space of the robot. Therefore, the t
 
 For that we need to define a version of the robot that takes actions in the end-effector space. Check the robot class `SO100FollowerEndEffector` and its configuration `SO100FollowerEndEffectorConfig` for the default parameters related to the end-effector space.
 
-{/* prettier-ignore-start */}
+<!-- prettier-ignore-start -->
 ```python
 class SO100FollowerEndEffectorConfig(SO100FollowerConfig):
     """Configuration for the SO100FollowerEndEffector robot."""
@@ -429,7 +429,7 @@ class SO100FollowerEndEffectorConfig(SO100FollowerConfig):
         }
     )
 ```
-{/* prettier-ignore-end */}
+<!-- prettier-ignore-end -->
 
 The `Teleoperator` defines the teleoperation device. You can check the list of available teleoperators in `lerobot/teleoperators`.
 
@@ -722,7 +722,7 @@ lerobot-train --config_path path/to/reward_classifier_train_config.json
 
 To use your trained reward classifier, configure the `HILSerlRobotEnvConfig` to use your model:
 
-{/* prettier-ignore-start */}
+<!-- prettier-ignore-start -->
 ```python
 config = GymManipulatorConfig(
     env=HILSerlRobotEnvConfig(
@@ -737,7 +737,7 @@ config = GymManipulatorConfig(
     mode=None  # For training
 )
 ```
-{/* prettier-ignore-end */}
+<!-- prettier-ignore-end -->
 
 or set the argument in the json config file.
 

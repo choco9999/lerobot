@@ -459,15 +459,7 @@ def make_policy(
             raise ValueError("env_cfg cannot be None when ds_meta is not provided")
         features = env_to_policy_features(env_cfg)
 
-    inferred_output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
-    if inferred_output_features:
-        cfg.output_features = inferred_output_features
-    elif not cfg.output_features:
-        raise ValueError(
-            "Could not infer policy output features from the provided dataset/environment. "
-            "Please set `policy.output_features` in your config (it must include the 'action' key), "
-            "or provide a dataset/environment that defines action features."
-        )
+    cfg.output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
     if not cfg.input_features:
         cfg.input_features = {key: ft for key, ft in features.items() if key not in cfg.output_features}
     kwargs["config"] = cfg
