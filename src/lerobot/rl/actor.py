@@ -253,7 +253,7 @@ def act_with_policy(
         log_dir = os.path.join(cfg.output_dir, "logs")
         os.makedirs(log_dir, exist_ok=True)
         action_chunk_log_path = os.path.join(log_dir, f"act_action_chunks_{os.getpid()}.jsonl")
-        action_chunk_log_f = open(action_chunk_log_path, "a", encoding="utf-8")
+        action_chunk_log_f = open(action_chunk_log_path, "a", encoding="utf-8")  # noqa: SIM115
         logging.info(f"[ACTOR] ACT action-chunk logging enabled: {action_chunk_log_path}")
 
     logging.info("make_env online")

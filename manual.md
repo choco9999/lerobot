@@ -88,12 +88,15 @@ Learner は以下の2種類のリプレイバッファを使い、原則 **50/50
 
 ### ACT→RL（sac_act）を使う手順
 
-1) `src/lerobot/configs/train_config_hilserl_so101_act.json` をベースに設定
-2) 最低限以下を編集
+1. `src/lerobot/configs/train_config_hilserl_so101_act.json` をベースに設定
+2. 最低限以下を編集
+
 - `policy.act_pretrained_path`（ACTの `pretrained_model/` へのパス）
 - `policy.dataset_stats.action.min/max`（実機スケールに合わせる）
 - `env.robot.port` / `env.teleop.port` / `env.robot.cameras.*.index_or_path`
-3) 起動コマンド（learner/actor）は同じ
+
+3. 起動コマンド（learner/actor）は同じ
+
 ```bash
 python -m lerobot.rl.learner --config_path src/lerobot/configs/train_config_hilserl_so101_act.json
 python -m lerobot.rl.actor   --config_path src/lerobot/configs/train_config_hilserl_so101_act.json

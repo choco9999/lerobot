@@ -505,8 +505,8 @@ class SACPolicy(
             residual_stats = getattr(self.actor, "_last_residual_stats", None)
             if isinstance(residual_stats, dict):
                 self._last_act_residual_stats = {k: v.detach() for k, v in residual_stats.items()}
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.getLogger(__name__).debug("ACT residual stats unavailable.", exc_info=exc)
         bc_weight = float(getattr(self.config, "intervention_bc_loss_weight", 0.0) or 0.0)
         bc_only_weight = float(
             getattr(self.config, "intervention_bc_loss_weight_bc_only", bc_weight) or bc_weight
@@ -1382,8 +1382,8 @@ class _ACTGaussianActor(nn.Module):
                 if action_min.numel() == action_dim and action_max.numel() == action_dim:
                     denom = (action_max - action_min).clamp(min=1e-6)
                     state_in = 2.0 * (state_in - action_min) / denom - 1.0
-            except Exception:
-                pass
+            except Exception as exc:
+                logging.getLogger(__name__).debug("Failed to normalize residual inputs.", exc_info=exc)
         residual_raw = self.residual_network(state_in)
         if not isinstance(residual_raw, Tensor) or residual_raw.shape != (
             state_in.shape[0],
@@ -1565,8 +1565,8 @@ class _ACTGaussianActor(nn.Module):
             self.act_policy._last_action_chunk = actions_seq
             prev_id = getattr(self.act_policy, "_last_action_chunk_id", 0)
             self.act_policy._last_action_chunk_id = int(prev_id) + 1
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.getLogger(__name__).debug("Failed to cache ACT action chunk.", exc_info=exc)
 
         if actions_seq.ndim != 3:
             raise ValueError(
@@ -1618,7 +1618,7 @@ class _ACTGaussianActor(nn.Module):
             if missing:
                 available_images = sorted(
                     key
-                    for key in batch.keys()
+                    for key in batch
                     if key == OBS_IMAGE or key.startswith(f"{OBS_IMAGES}.") or key.startswith(f"{OBS_IMAGE}.")
                 )
                 raise KeyError(
@@ -1658,8 +1658,8 @@ class _ACTGaussianActor(nn.Module):
             self.act_policy._last_action_chunk = actions_seq
             prev_id = getattr(self.act_policy, "_last_action_chunk_id", 0)
             self.act_policy._last_action_chunk_id = int(prev_id) + 1
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.getLogger(__name__).debug("Failed to cache ACT action chunk.", exc_info=exc)
         if actions_seq.ndim != 3:
             raise ValueError(
                 f"Expected ACT to return (B, S, D) actions, got shape {tuple(actions_seq.shape)}"
@@ -1717,8 +1717,10 @@ class _ACTGaussianActor(nn.Module):
                 if self._prefetch_inflight():
                     try:
                         return self._hold_action_from_state(observations)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logging.getLogger(__name__).debug(
+                            "Failed to compute ACT hold action during prefetch.", exc_info=exc
+                        )
 
                 try:
                     actions_cpu = self._compute_prior_action_chunk(observations)

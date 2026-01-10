@@ -15,7 +15,14 @@
 default_language_version:
     python: python3.10
 
-exclude: "tests/artifacts/.*\\.safetensors$"
+exclude: |
+  (?x)^(
+    tests/artifacts/.*\.safetensors$
+    | lerobot-kin-env/
+    | datasets/pusht_full/
+    | Untitled-1_optimized\.py$
+    | cell5_dump\.py$
+  )
 
 repos:
   ##### Meta #####

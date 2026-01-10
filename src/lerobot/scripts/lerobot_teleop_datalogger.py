@@ -247,7 +247,7 @@ def teleop_datalogger_loop(
             )  # observation not needed by default pipeline
             robot_action_to_send = robot_action_processor((teleop_action, None))
             proc_t1 = time.perf_counter()
-            _ = proc_t1  # placeholder for future timing breakdown if needed
+            row["proc_dt_ms"] = (proc_t1 - proc_t0) * 1e3
 
             send_t0 = time.perf_counter()
             sent_action, send_err = _safe_call(robot.send_action, robot_action_to_send)

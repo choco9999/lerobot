@@ -210,7 +210,15 @@ where = ["src"]
 [tool.ruff]
 target-version = "py310"
 line-length = 110
-exclude = ["tests/artifacts/**/*.safetensors", "*_pb2.py", "*_pb2_grpc.py"]
+exclude = [
+    "tests/artifacts/**/*.safetensors",
+    "*_pb2.py",
+    "*_pb2_grpc.py",
+    "lerobot-kin-env/**",
+    "datasets/pusht_full/**",
+    "Untitled-1_optimized.py",
+    "cell5_dump.py",
+]
 
 [tool.ruff.lint]
 # E, W: pycodestyle errors and warnings
@@ -260,6 +268,8 @@ exclude_dirs = [
     "tests",
     "benchmarks",
     "src/lerobot/datasets/push_dataset_to_hub",
+    "lerobot-kin-env",
+    "datasets/pusht_full",
 ]
 skips = ["B101", "B311", "B404", "B603", "B615"]
 

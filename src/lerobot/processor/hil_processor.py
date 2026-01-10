@@ -840,10 +840,7 @@ class MaxRelativeTargetActionProcessorStep(ProcessorStep):
             return new_transition
 
         info = new_transition.get(TransitionKey.INFO, {})
-        if not isinstance(info, dict):
-            info = {}
-        else:
-            info = dict(info)
+        info = {} if not isinstance(info, dict) else dict(info)
 
         if isinstance(self.max_relative_target, float):
             max_diff = torch.full_like(action, float(self.max_relative_target))

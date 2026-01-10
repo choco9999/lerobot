@@ -447,7 +447,7 @@ def add_actor_information_and_train(
                 batch_size=online_batch_size, async_prefetch=async_prefetch, queue_size=2
             )
 
-        def _sample_hilserl_batch() -> dict:
+        def _sample_hilserl_batch(online_iterator=online_iterator) -> dict:
             nonlocal warned_missing_human_batch, warned_missing_success_batch, logged_using_success_buffer
             batch = next(online_iterator)
             additions: list[dict] = []
@@ -621,8 +621,8 @@ def add_actor_information_and_train(
             batch_reward_max = float(rewards.max().item())
             training_infos["batch_reward_mean"] = batch_reward_mean
             training_infos["batch_reward_max"] = batch_reward_max
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.getLogger(__name__).debug("Failed to compute batch reward stats.", exc_info=exc)
 
         # Discrete critic optimization (if available)
         if policy.config.num_discrete_actions is not None:
@@ -679,8 +679,10 @@ def add_actor_information_and_train(
                     try:
                         rewards_success = success_replay_buffer.rewards[: len(success_replay_buffer)]
                         positive_reward_transitions += int((rewards_success > 0).sum().item())
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logging.getLogger(__name__).debug(
+                            "Failed to count success buffer rewards.", exc_info=exc
+                        )
                 if positive_reward_transitions < min_positive:
                     actor_updates_allowed = False
                     skip_insufficient_positive_transitions = True
@@ -786,8 +788,10 @@ def add_actor_information_and_train(
                     for key, value in stats_critic.items():
                         if isinstance(value, torch.Tensor) and value.numel() == 1:
                             training_infos[f"critic_{key}"] = float(value.item())
-            except Exception:
-                pass
+            except Exception as exc:
+                logging.getLogger(__name__).debug(
+                    "Failed to read actor/critic max-relative-target stats.", exc_info=exc
+                )
             # Log SAC-ACT residual policy diagnostics (if enabled).
             try:
                 residual_stats = getattr(policy, "_last_act_residual_stats", None)
@@ -795,8 +799,8 @@ def add_actor_information_and_train(
                     for key, value in residual_stats.items():
                         if isinstance(value, torch.Tensor) and value.numel() == 1:
                             training_infos[f"actor_{key}"] = float(value.item())
-            except Exception:
-                pass
+            except Exception as exc:
+                logging.getLogger(__name__).debug("Failed to read ACT residual policy stats.", exc_info=exc)
 
             # Log training metrics
             if wandb_logger:
@@ -1420,9 +1424,11 @@ def push_actor_policy_to_queue(parameters_queue: Queue, policy: nn.Module):
         try:
             _ = parameters_queue.get_nowait()
         except QueueEmpty:
-            pass
-        except Exception:  # noqa: BLE001
-            pass
+            logging.getLogger(__name__).debug("[LEARNER] Parameters queue empty when dropping stale params.")
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger(__name__).debug(
+                "[LEARNER] Failed to drop stale parameters from queue.", exc_info=exc
+            )
 
     try:
         parameters_queue.put(state_bytes, block=False)

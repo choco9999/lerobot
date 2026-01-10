@@ -33,4 +33,3 @@ python -m src.lerobot.scripts.lerobot_record  \
     --dataset.single_task="Grab the black cube" \
     --policy.device=mps \
     --policy.path=chocolat-nya/record_home
-

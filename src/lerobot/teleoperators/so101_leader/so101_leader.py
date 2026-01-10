@@ -145,9 +145,8 @@ class SO101Leader(Teleoperator):
                     self._event_queue.put("space")
             elif key == pynput_keyboard.Key.esc:
                 self._event_queue.put("esc")
-            elif hasattr(key, "char") and key.char is not None:
-                if key.char in {"s", "r", "q"}:
-                    self._event_queue.put(key.char)
+            elif getattr(key, "char", None) in {"s", "r", "q"}:
+                self._event_queue.put(key.char)
         except Exception:  # noqa: BLE001
             return
 

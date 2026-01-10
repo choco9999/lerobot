@@ -228,17 +228,19 @@ class ReplayBuffer:
         # Store the transition in pre-allocated tensors
         for key in self.states:
             src_state = state[key].squeeze(dim=0)
-            if self.store_images_as_uint8 and key.startswith(OBS_IMAGE):
-                if src_state.dtype != torch.uint8:
-                    src_state = (src_state * 255.0).round().clamp(0, 255).to(torch.uint8)
+            if self.store_images_as_uint8 and key.startswith(OBS_IMAGE) and src_state.dtype != torch.uint8:
+                src_state = (src_state * 255.0).round().clamp(0, 255).to(torch.uint8)
             self.states[key][self.position].copy_(src_state.to(self.storage_device))
 
             if not self.optimize_memory:
                 # Only store next_states if not optimizing memory
                 src_next_state = next_state[key].squeeze(dim=0)
-                if self.store_images_as_uint8 and key.startswith(OBS_IMAGE):
-                    if src_next_state.dtype != torch.uint8:
-                        src_next_state = (src_next_state * 255.0).round().clamp(0, 255).to(torch.uint8)
+                if (
+                    self.store_images_as_uint8
+                    and key.startswith(OBS_IMAGE)
+                    and src_next_state.dtype != torch.uint8
+                ):
+                    src_next_state = (src_next_state * 255.0).round().clamp(0, 255).to(torch.uint8)
                 self.next_states[key][self.position].copy_(src_next_state.to(self.storage_device))
 
         self.actions[self.position].copy_(action.squeeze(dim=0).to(self.storage_device))
@@ -614,10 +616,7 @@ class ReplayBuffer:
         if extra_complementary_info is not None:
             for transition in list_transition:
                 complementary_info = transition.get("complementary_info")
-                if complementary_info is None:
-                    complementary_info = {}
-                else:
-                    complementary_info = dict(complementary_info)
+                complementary_info = {} if complementary_info is None else dict(complementary_info)
                 complementary_info.update(extra_complementary_info)
                 transition["complementary_info"] = complementary_info
 

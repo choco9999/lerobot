@@ -29,9 +29,8 @@ import fsspec
 import pyarrow as pa
 import torch
 import torchvision
-from PIL import Image
-
 from datasets.features.features import register_feature
+from PIL import Image
 
 
 def get_safe_default_codec():
