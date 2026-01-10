@@ -1,3 +1,4 @@
+# ruff: noqa
 end = stage("Step 5: # ------------------")
 # ------------------
 # 4) Basic feature engineering (tables)
@@ -102,7 +103,66 @@ df_test = compute_text_list_features(df_test)
 NO_QUANT_TERMS = set(
     map(
         str.lower,
-        ["parsley", "cilantro", "basil", "mint", "chives", "dill", "oregano", "thyme", "rosemary", "sage", "coriander", "coriander", "leaves", "coriander", "leaf", "scallion", "scallions", "green", "onion", "green", "onions", "spring", "onion", "spring", "onions", "salt", "pepper", "black", "pepper", "white", "pepper", "paprika", "chili", "powder", "cayenne", "cumin", "turmeric", "cinnamon", "nutmeg", "allspice", "clove", "cloves", "garnish", "lemon", "zest", "lemon", "rind", "lemon", "peel", "orange", "zest", "orange", "rind", "orange", "peel", "zest", "rind", "peel"],
+        [
+            "parsley",
+            "cilantro",
+            "basil",
+            "mint",
+            "chives",
+            "dill",
+            "oregano",
+            "thyme",
+            "rosemary",
+            "sage",
+            "coriander",
+            "coriander",
+            "leaves",
+            "coriander",
+            "leaf",
+            "scallion",
+            "scallions",
+            "green",
+            "onion",
+            "green",
+            "onions",
+            "spring",
+            "onion",
+            "spring",
+            "onions",
+            "salt",
+            "pepper",
+            "black",
+            "pepper",
+            "white",
+            "pepper",
+            "paprika",
+            "chili",
+            "powder",
+            "cayenne",
+            "cumin",
+            "turmeric",
+            "cinnamon",
+            "nutmeg",
+            "allspice",
+            "clove",
+            "cloves",
+            "garnish",
+            "lemon",
+            "zest",
+            "lemon",
+            "rind",
+            "lemon",
+            "peel",
+            "orange",
+            "zest",
+            "orange",
+            "rind",
+            "orange",
+            "peel",
+            "zest",
+            "rind",
+            "peel",
+        ],
     )
 )
 NO_QUANT_REGEXES = [
@@ -284,7 +344,8 @@ def build_ingredient_features(df):
         return " ".join(pairs)
 
     df["IngredientPairText"] = [
-        pair_text(p, q) for p, q in zip(df["IngredientParts_List"], df["IngredientQuantities_List"], strict=False)
+        pair_text(p, q)
+        for p, q in zip(df["IngredientParts_List"], df["IngredientQuantities_List"], strict=False)
     ]
 
     qs = df["IngredientQuantities_List"]

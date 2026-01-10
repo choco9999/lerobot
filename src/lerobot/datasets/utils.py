@@ -30,6 +30,7 @@ import pandas as pd
 import pyarrow.dataset as pa_ds
 import pyarrow.parquet as pq
 import torch
+from datasets.table import embed_table_storage
 from huggingface_hub import DatasetCard, DatasetCardData, HfApi
 from huggingface_hub.errors import RevisionNotFoundError
 from PIL import Image as PILImage
@@ -37,7 +38,6 @@ from torchvision import transforms
 
 import datasets
 from datasets import Dataset
-from datasets.table import embed_table_storage
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.datasets.backward_compatibility import (
     FUTURE_MESSAGE,
