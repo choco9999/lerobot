@@ -16,6 +16,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import NormalizationMode
@@ -118,6 +119,36 @@ class SACConfig(PreTrainedConfig):
         }
     )
 
+    # Optional environment-side safety constraint: maximum per-step delta (in robot joint units)
+    # between the commanded absolute target action and the current joint positions. When set,
+    # SAC will project sampled actions to this constraint during critic target computation and
+    # actor optimization, aligning learning with the action-processor clamp used on real robots.
+    #
+    # NOTE: This is only meaningful for joint-space *absolute target* control with known action
+    # bounds (`dataset_stats.action.min/max`) and an `observation.state` that contains raw joint
+    # positions in the same units.
+    max_relative_target: float | None = None
+
+    # Additional actor regularization weight to discourage violating `max_relative_target`.
+    # This penalizes the distance between the raw sampled action and the projected action in
+    # SAC's normalized [-1, 1] action space.
+    max_relative_target_violation_penalty: float = 0.0
+
+    # Optional behavior-cloning style regularization on human intervention / demo transitions.
+    # When > 0, the SAC actor loss adds an MSE term that nudges the *deterministic* policy action
+    # toward the dataset action for transitions whose `complementary_info['is_intervention']` is True.
+    intervention_bc_loss_weight: float = 0.0
+
+    # When the learner runs a BC-only actor update (e.g., sparse-reward HIL before any successes),
+    # use this weight for the intervention BC loss. This is typically larger than
+    # `intervention_bc_loss_weight` (which acts as a regularizer during RL updates).
+    intervention_bc_loss_weight_bc_only: float = 1.0
+
+    # HIL-SERL safety guard: when True, skip actor/temperature updates until the "human buffer"
+    # (offline demos + online interventions) contains at least one transition. This prevents
+    # catastrophic policy drift from sparse/noisy rewards when training starts from a strong prior.
+    require_human_buffer_for_actor_update: bool = False
+
     # Architecture specifics
     # Device to run the model on (e.g., "cuda", "cpu")
     device: str = "cpu"
@@ -143,10 +174,24 @@ class SACConfig(PreTrainedConfig):
     online_buffer_capacity: int = 100000
     # Capacity of the offline replay buffer
     offline_buffer_capacity: int = 100000
+    # Success-reward shaping for sparse-reward setups (e.g., prompt-based success labels).
+    # If > 0, when a terminal transition with reward>0 is observed, the learner will assign a small
+    # positive reward to the previous `success_reward_shaping_tail_steps` transitions in that episode.
+    # This helps learning signal propagate earlier without requiring a reward classifier.
+    success_reward_shaping_tail_steps: int = 0
+    # Per-step reward assigned during success-tail shaping. If None, defaults to (terminal_reward / tail_steps).
+    success_reward_shaping_tail_reward: float | None = None
+    # Optional replay buffer that stores recent "success tail" transitions so learning can continue even
+    # after the online buffer has been overwritten by failures. Set to 0 to disable.
+    success_replay_buffer_capacity: int = 0
     # Whether to use asynchronous prefetching for the buffers
     async_prefetch: bool = False
     # Number of steps before learning starts
     online_step_before_learning: int = 100
+    # Minimum number of transitions with reward > 0 required before starting actor/temperature updates.
+    # This is useful for sparse-reward HIL settings to avoid catastrophic drift when only failures
+    # (reward==0) have been observed so far.
+    min_positive_reward_transitions_before_actor_update: int = 0
     # Frequency of policy updates
     policy_update_freq: int = 1
 
@@ -237,6 +282,81 @@ class SACConfig(PreTrainedConfig):
     @property
     def action_delta_indices(self) -> list:
         return None  # SAC typically predicts one action at a time
+
+    @property
+    def reward_delta_indices(self) -> list | None:
+        return None
+
+
+@PreTrainedConfig.register_subclass("sac_act")
+@dataclass
+class SACActConfig(SACConfig):
+    """SAC configuration that initializes (and fine-tunes) the actor from a pretrained ACT checkpoint.
+
+    This is intended for "ACT imitation -> HIL-SERL RL" workflows where you want to start RL from an
+    existing ACT policy. The critic and temperature are standard SAC components; only the actor is
+    replaced by an ACT-backed stochastic actor.
+    """
+
+    # Path to the ACT policy directory that contains `config.json` and `model.safetensors`
+    # (typically: `.../checkpoints/<step>/pretrained_model/`).
+    act_pretrained_path: Path | None = None
+
+    # If True, load and apply the ACT `policy_preprocessor.json` pipeline before feeding observations
+    # to the ACT model. This helps match the observation normalization used during ACT training.
+    act_use_preprocessor: bool = True
+
+    # If True, load and apply the ACT `policy_postprocessor.json` pipeline to the ACT action outputs.
+    # This is typically required when ACT was trained with ACTION normalization modes like MEAN_STD.
+    act_use_postprocessor: bool = True
+
+    # If True, use ACT prior deterministically during inference (distribution mode) instead of sampling.
+    act_deterministic_inference: bool = False
+
+    # If True, use the underlying ACT action-queue logic (ACTPolicy.select_action) during inference.
+    # This matches ACT's action-chunk execution, but is open-loop for `n_action_steps > 1`.
+    act_use_action_queue: bool = False
+
+    # If True, prefetch the next ACT action chunk in a background thread when using
+    # `act_use_action_queue=True`. This avoids occasional control-loop stalls when the
+    # ACT queue is refreshed (common on real robots).
+    act_prefetch_action_queue: bool = False
+
+    # Start prefetch when the ACT action-queue has <= this many remaining actions.
+    # Only used when `act_prefetch_action_queue=True`.
+    act_prefetch_min_queue_len: int = 10
+
+    # Which action index to use from ACT's predicted action chunk.
+    # 0 means "use the first action in the chunk".
+    act_action_index: int = 0
+
+    # Initial standard deviation (in tanh-Gaussian base space) for the stochastic actor built on top of ACT.
+    act_init_std: float = 0.2
+
+    # Scale factor applied to `policy.actor_lr` for the ACT backbone parameters.
+    # ACT models are typically much larger than the default MLP actor, so using a smaller LR helps
+    # avoid catastrophic drift in sparse-reward HIL settings.
+    act_finetune_lr_scale: float = 0.1
+
+    # If True, freeze the ACT policy backbone weights during RL and learn only auxiliary parameters
+    # (e.g. log_std or an optional residual policy head). This prevents catastrophic drift when the
+    # reward signal is sparse/noisy and the pretrained policy is already reasonably good.
+    act_freeze_backbone: bool = False
+
+    # Optional residual policy (in SAC-normalized [-1, 1] action space) added on top of the ACT prior.
+    # The residual is initialized to output zeros so inference starts identical to the pretrained ACT.
+    # A good default scale is around 0.05-0.15 (roughly 5-15 degrees when action range is [-100, 100]).
+    act_residual_scale: float = 0.0
+    act_residual_hidden_dims: list[int] = field(default_factory=lambda: [64, 64])
+
+    # If True, the RL actor process logs ACT's predicted action chunks (shape: B x chunk_size x action_dim)
+    # to a JSONL file under `<output_dir>/logs/`.
+    act_log_action_chunk: bool = False
+
+    def __post_init__(self):
+        super().__post_init__()
+        # Actor/critic encoders cannot be shared when the actor is ACT-backed.
+        self.shared_encoder = False
 
     @property
     def reward_delta_indices(self) -> None:

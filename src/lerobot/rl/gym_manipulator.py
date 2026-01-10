@@ -35,12 +35,15 @@ from lerobot.processor import (
     DataProcessorPipeline,
     DeviceProcessorStep,
     EnvTransition,
+    FinalizeHILActionProcessorStep,
     GripperPenaltyProcessorStep,
     ImageCropResizeProcessorStep,
     InterventionActionProcessorStep,
     JointVelocityProcessorStep,
     MapDeltaActionToRobotActionStep,
     MapTensorToDeltaActionDictStep,
+    MaxRelativeTargetActionProcessorStep,
+    MinMaxUnnormalizeActionProcessorStep,
     MotorCurrentProcessorStep,
     Numpy2TorchActionProcessorStep,
     RewardClassifierProcessorStep,
@@ -247,11 +250,17 @@ class RobotEnv(gym.Env):
         self.episode_data = None
         obs = self._get_observation()
         self._raw_joint_positions = {f"{key}.pos": obs[f"{key}.pos"] for key in self._joint_names}
-        return obs, {TeleopEvents.IS_INTERVENTION: False}
+        # Teleop/intervention events are injected by the action-processor pipeline; avoid
+        # returning placeholder TeleopEvents here as it can overwrite the true state downstream.
+        return obs, {}
 
     def step(self, action) -> tuple[dict[str, np.ndarray], float, bool, bool, dict[str, Any]]:
         """Execute one environment step with given action."""
-        joint_targets_dict = {f"{key}.pos": action[i] for i, key in enumerate(self.robot.bus.motors.keys())}
+        # Ensure we pass plain Python scalars to the robot driver. Torch/NumPy scalars can
+        # trigger subtle type/compare issues in downstream safety clamps and motor buses.
+        joint_targets_dict = {
+            f"{key}.pos": float(action[i]) for i, key in enumerate(self.robot.bus.motors.keys())
+        }
 
         self.robot.send_action(joint_targets_dict)
 
@@ -273,7 +282,8 @@ class RobotEnv(gym.Env):
             reward,
             terminated,
             truncated,
-            {TeleopEvents.IS_INTERVENTION: False},
+            # Teleop/intervention events are handled by the action-processor pipeline.
+            {},
         )
 
     def render(self) -> None:
@@ -340,19 +350,28 @@ def make_robot_env(cfg: HILSerlRobotEnvConfig) -> tuple[gym.Env, Any]:
         cfg.processor.observation.display_cameras if cfg.processor.observation is not None else False
     )
     reset_pose = cfg.processor.reset.fixed_reset_joint_positions if cfg.processor.reset is not None else None
+    reset_time_s = cfg.processor.reset.reset_time_s if cfg.processor.reset is not None else 5.0
 
     env = RobotEnv(
         robot=robot,
         use_gripper=use_gripper,
         display_cameras=display_cameras,
         reset_pose=reset_pose,
+        reset_time_s=reset_time_s,
     )
 
     return env, teleop_device
 
 
 def make_processors(
-    env: gym.Env, teleop_device: Teleoperator | None, cfg: HILSerlRobotEnvConfig, device: str = "cpu"
+    env: gym.Env,
+    teleop_device: Teleoperator | None,
+    cfg: HILSerlRobotEnvConfig,
+    device: str = "cpu",
+    *,
+    action_min: list[float] | None = None,
+    action_max: list[float] | None = None,
+    keep_images_as_uint8: bool = False,
 ) -> tuple[
     DataProcessorPipeline[EnvTransition, EnvTransition], DataProcessorPipeline[EnvTransition, EnvTransition]
 ]:
@@ -379,7 +398,7 @@ def make_processors(
 
         env_pipeline_steps = [
             Numpy2TorchActionProcessorStep(),
-            VanillaObservationProcessorStep(),
+            VanillaObservationProcessorStep(keep_images_as_uint8=keep_images_as_uint8),
             AddBatchDimensionProcessorStep(),
             DeviceProcessorStep(device=device),
         ]
@@ -393,6 +412,9 @@ def make_processors(
     # Full processor pipeline for real robot environment
     # Get robot and motor information for kinematics
     motor_names = list(env.robot.bus.motors.keys())
+    max_relative_target = None
+    if cfg.robot is not None:
+        max_relative_target = getattr(cfg.robot, "max_relative_target", None)
 
     # Set up kinematics solver if inverse kinematics is configured
     kinematics_solver = None
@@ -403,7 +425,7 @@ def make_processors(
             joint_names=motor_names,
         )
 
-    env_pipeline_steps = [VanillaObservationProcessorStep()]
+    env_pipeline_steps = [VanillaObservationProcessorStep(keep_images_as_uint8=keep_images_as_uint8)]
 
     if cfg.processor.observation is not None:
         if cfg.processor.observation.add_joint_velocity_to_observation:
@@ -460,12 +482,18 @@ def make_processors(
     env_pipeline_steps.append(DeviceProcessorStep(device=device))
 
     action_pipeline_steps = [
-        AddTeleopActionAsComplimentaryDataStep(teleop_device=teleop_device),
         AddTeleopEventsAsInfoStep(teleop_device=teleop_device),
+        AddTeleopActionAsComplimentaryDataStep(teleop_device=teleop_device),
         InterventionActionProcessorStep(
             use_gripper=cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else False,
             terminate_on_success=terminate_on_success,
+            action_min=action_min,
+            action_max=action_max,
+            normalize_teleop_action=(
+                action_min is not None and action_max is not None and cfg.processor.inverse_kinematics is None
+            ),
         ),
+        FinalizeHILActionProcessorStep(),
     ]
 
     # Replace InverseKinematicsProcessor with new kinematic processors
@@ -497,6 +525,19 @@ def make_processors(
         ]
         action_pipeline_steps.extend(inverse_kinematics_steps)
         action_pipeline_steps.append(RobotActionToPolicyActionProcessorStep(motor_names=motor_names))
+    elif action_min is not None and action_max is not None:
+        action_pipeline_steps.append(
+            MinMaxUnnormalizeActionProcessorStep(action_min=action_min, action_max=action_max)
+        )
+        if max_relative_target is not None:
+            action_pipeline_steps.append(
+                MaxRelativeTargetActionProcessorStep(
+                    motor_names=motor_names,
+                    max_relative_target=max_relative_target,
+                    action_min=action_min,
+                    action_max=action_max,
+                )
+            )
 
     return DataProcessorPipeline(
         steps=env_pipeline_steps, to_transition=identity_transition, to_output=identity_transition
@@ -526,22 +567,35 @@ def step_env_and_process_transition(
         Processed transition with updated state.
     """
 
+    t0 = time.perf_counter()
+
     # Create action transition
     transition[TransitionKey.ACTION] = action
     transition[TransitionKey.OBSERVATION] = (
         env.get_raw_joint_positions() if hasattr(env, "get_raw_joint_positions") else {}
     )
     processed_action_transition = action_processor(transition)
+    t1 = time.perf_counter()
     processed_action = processed_action_transition[TransitionKey.ACTION]
 
     obs, reward, terminated, truncated, info = env.step(processed_action)
+    t2 = time.perf_counter()
 
     reward = reward + processed_action_transition[TransitionKey.REWARD]
     terminated = terminated or processed_action_transition[TransitionKey.DONE]
     truncated = truncated or processed_action_transition[TransitionKey.TRUNCATED]
     complementary_data = processed_action_transition[TransitionKey.COMPLEMENTARY_DATA].copy()
     new_info = processed_action_transition[TransitionKey.INFO].copy()
-    new_info.update(info)
+    # Merge env-provided info without clobbering action-processor metadata such as teleop events.
+    # Action-processor values take precedence on key collisions.
+    if isinstance(info, dict):
+        new_info = dict(info)
+        new_info.update(processed_action_transition[TransitionKey.INFO].copy())
+
+    # Attach timing breakdown (milliseconds) for debugging control-loop jitter.
+    # These are NOT sent to the learner (we only stream state/action/reward/done/truncated).
+    new_info["_timing_action_processor_ms"] = (t1 - t0) * 1e3
+    new_info["_timing_env_step_ms"] = (t2 - t1) * 1e3
 
     new_transition = create_transition(
         observation=obs,
@@ -553,6 +607,9 @@ def step_env_and_process_transition(
         complementary_data=complementary_data,
     )
     new_transition = env_processor(new_transition)
+    t3 = time.perf_counter()
+    new_transition[TransitionKey.INFO]["_timing_env_processor_ms"] = (t3 - t2) * 1e3
+    new_transition[TransitionKey.INFO]["_timing_total_ms"] = (t3 - t0) * 1e3
 
     return new_transition
 

@@ -58,6 +58,7 @@ class TrainPipelineConfig(HubMixin):
     log_freq: int = 200
     tolerance_s: float = 1e-4
     save_checkpoint: bool = True
+    save_replay_buffer_dataset: bool = False
     # Checkpoint is saved every `save_freq` training iterations and after the last training step.
     save_freq: int = 20_000
     use_policy_training_preset: bool = True
@@ -126,7 +127,7 @@ class TrainPipelineConfig(HubMixin):
             train_dir = f"{now:%Y-%m-%d}/{now:%H-%M-%S}_{self.job_name}"
             self.output_dir = Path("outputs/train") / train_dir
 
-        if isinstance(self.dataset.repo_id, list):
+        if self.dataset is not None and isinstance(self.dataset.repo_id, list):
             raise NotImplementedError("LeRobotMultiDataset is not currently implemented.")
 
         if not self.use_policy_training_preset and (self.optimizer is None or self.scheduler is None):
@@ -141,6 +142,8 @@ class TrainPipelineConfig(HubMixin):
             )
 
         if self.use_rabc and not self.rabc_progress_path:
+            if self.dataset is None:
+                raise ValueError("`use_rabc=True` requires a dataset config.")
             # Auto-detect from dataset path
             repo_id = self.dataset.repo_id
             if self.dataset.root:

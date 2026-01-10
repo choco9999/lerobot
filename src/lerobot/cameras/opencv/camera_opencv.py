@@ -502,7 +502,27 @@ class OpenCVCamera(Camera):
         if self.thread is None or not self.thread.is_alive():
             self._start_read_thread()
 
+        # Fast path: if we already have a frame and nothing new is signaled, return immediately.
+        with self.frame_lock:
+            cached = self.latest_frame
+
+        if cached is not None and not self.new_frame_event.is_set():
+            return cached
+
+        # If a new frame is already available, consume it without waiting.
+        if self.new_frame_event.is_set():
+            with self.frame_lock:
+                frame = self.latest_frame
+                self.new_frame_event.clear()
+            if frame is None:
+                raise RuntimeError(f"Internal error: Event set but no frame available for {self}.")
+            return frame
+
+        # Otherwise, wait up to timeout_ms for a first/new frame. If we already have a cached
+        # frame, fall back to it rather than raising (helps keep control loops alive).
         if not self.new_frame_event.wait(timeout=timeout_ms / 1000.0):
+            if cached is not None:
+                return cached
             thread_alive = self.thread is not None and self.thread.is_alive()
             raise TimeoutError(
                 f"Timed out waiting for frame from camera {self} after {timeout_ms} ms. "

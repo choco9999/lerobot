@@ -526,7 +526,26 @@ class RealSenseCamera(Camera):
         if self.thread is None or not self.thread.is_alive():
             self._start_read_thread()
 
+        # Fast path: return cached frame if nothing new is signaled.
+        with self.frame_lock:
+            cached = self.latest_frame
+
+        if cached is not None and not self.new_frame_event.is_set():
+            return cached
+
+        # Consume any already-available new frame without waiting.
+        if self.new_frame_event.is_set():
+            with self.frame_lock:
+                frame = self.latest_frame
+                self.new_frame_event.clear()
+            if frame is None:
+                raise RuntimeError(f"Internal error: Event set but no frame available for {self}.")
+            return frame
+
+        # Wait for first/new frame, but fall back to cached if available.
         if not self.new_frame_event.wait(timeout=timeout_ms / 1000.0):
+            if cached is not None:
+                return cached
             thread_alive = self.thread is not None and self.thread.is_alive()
             raise TimeoutError(
                 f"Timed out waiting for frame from camera {self} after {timeout_ms} ms. "

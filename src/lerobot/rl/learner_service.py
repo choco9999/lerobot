@@ -16,6 +16,7 @@
 # limitations under the License.
 
 import logging
+import threading
 import time
 from multiprocessing import Event, Queue
 
@@ -49,28 +50,57 @@ class LearnerService(services_pb2_grpc.LearnerServiceServicer):
         self.transition_queue = transition_queue
         self.interaction_message_queue = interaction_message_queue
         self.queue_get_timeout = queue_get_timeout
+        self._latest_parameters: bytes | None = None
+        self._latest_parameters_version: int = 0
+        self._latest_parameters_lock = threading.Lock()
+
+    def _refresh_latest_parameters(self, *, block: bool) -> None:
+        buffer = get_last_item_from_queue(self.parameters_queue, block=block, timeout=self.queue_get_timeout)
+        if buffer is None:
+            return
+        with self._latest_parameters_lock:
+            self._latest_parameters = buffer
+            self._latest_parameters_version += 1
 
     def StreamParameters(self, request, context):  # noqa: N802
         # TODO: authorize the request
         logging.info("[LEARNER] Received request to stream parameters from the Actor")
 
-        last_push_time = 0
+        last_push_time = 0.0
+        last_sent_version = -1
 
         while not self.shutdown_event.is_set():
-            time_since_last_push = time.time() - last_push_time
-            if time_since_last_push < self.seconds_between_pushes:
-                self.shutdown_event.wait(self.seconds_between_pushes - time_since_last_push)
-                # Continue, because we could receive a shutdown event,
-                # and it's checked in the while loop
-                continue
+            if hasattr(context, "is_active") and not context.is_active():
+                break
 
-            logging.info("[LEARNER] Push parameters to the Actor")
-            buffer = get_last_item_from_queue(
-                self.parameters_queue, block=True, timeout=self.queue_get_timeout
-            )
+            # Always drain any pending parameter updates, but don't block the stream loop.
+            self._refresh_latest_parameters(block=False)
 
+            with self._latest_parameters_lock:
+                buffer = self._latest_parameters
+                buffer_version = self._latest_parameters_version
+
+            # Wait for the first set of parameters to become available.
             if buffer is None:
+                self._refresh_latest_parameters(block=True)
+                with self._latest_parameters_lock:
+                    buffer = self._latest_parameters
+                    buffer_version = self._latest_parameters_version
+                if buffer is None:
+                    continue
+
+            # If nothing new is available for this stream, wait briefly instead of busy looping.
+            if buffer_version == last_sent_version:
+                self.shutdown_event.wait(self.queue_get_timeout)
                 continue
+
+            # Rate-limit large parameter transfers.
+            time_since_last_push = time.time() - last_push_time
+            if last_push_time != 0.0 and time_since_last_push < self.seconds_between_pushes:
+                self.shutdown_event.wait(self.seconds_between_pushes - time_since_last_push)
+                continue
+
+            logging.info("[LEARNER] Push parameters to the Actor (version=%s)", buffer_version)
 
             yield from send_bytes_in_chunks(
                 buffer,
@@ -80,7 +110,8 @@ class LearnerService(services_pb2_grpc.LearnerServiceServicer):
             )
 
             last_push_time = time.time()
-            logging.info("[LEARNER] Parameters sent")
+            last_sent_version = buffer_version
+            logging.info("[LEARNER] Parameters sent (version=%s)", buffer_version)
 
         logging.info("[LEARNER] Stream parameters finished")
         return services_pb2.Empty()

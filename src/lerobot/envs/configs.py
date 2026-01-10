@@ -224,6 +224,7 @@ class ResetConfig:
     reset_time_s: float = 5.0
     control_time_s: float = 20.0
     terminate_on_success: bool = True
+    prompt_success_failure: bool = False
 
 
 @dataclass

@@ -110,9 +110,10 @@
         "success_reward_shaping_tail_steps": 50,
         "success_reward_shaping_tail_reward": null,
         "success_replay_buffer_capacity": 1000,
-        "max_relative_target": 10.0,
-        "max_relative_target_violation_penalty": 1.0,
+        "max_relative_target": 20.0,
+        "max_relative_target_violation_penalty": 5.0,
         "intervention_bc_loss_weight": 0.1,
+        "require_human_buffer_for_actor_update": true,
         "online_step_before_learning": 1000,
         "min_positive_reward_transitions_before_actor_update": 50,
         "policy_update_freq": 4,
@@ -121,9 +122,9 @@
         "temperature_init": 0.01,
         "num_critics": 2,
         "num_subsample_critics": null,
-        "critic_lr": 0.0003,
-        "actor_lr": 0.0003,
-        "temperature_lr": 0.0003,
+        "critic_lr": 0.0001,
+        "actor_lr": 0.0001,
+        "temperature_lr": 0.0001,
         "critic_target_update_weight": 0.005,
         "utd_ratio": 1,
         "state_encoder_hidden_dim": 256,
@@ -148,7 +149,8 @@
         },
         "policy_kwargs": {
             "use_tanh_squash": true,
-            "init_final": 0.05
+            "init_final": 0.05,
+            "std_max": 0.1
         },
         "actor_learner_config": {
             "learner_host": "127.0.0.1",
@@ -193,7 +195,7 @@
             "type": "so101_follower",
             "port": "/dev/ttyACM1",
             "id": "my_awesome_follower_arm",
-            "max_relative_target": 10.0,
+            "max_relative_target": 20.0,
             "cameras": {
                 "front": {
                     "type": "opencv",
@@ -214,7 +216,11 @@
         "teleop": {
             "type": "so101_leader",
             "port": "/dev/ttyACM0",
-            "id": "my_awesome_leader_arm"
+            "id": "my_awesome_leader_arm",
+            "auto_intervention": true,
+            "auto_intervention_threshold": 0.1,
+            "auto_intervention_hold_s": 1.0,
+            "auto_intervention_include_gripper": true
         }
     }
 }

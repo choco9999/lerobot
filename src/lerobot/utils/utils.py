@@ -147,11 +147,18 @@ def init_logging(
         accelerator: Optional Accelerator instance (for multi-GPU detection)
     """
 
+    import traceback
+
     def custom_format(record: logging.LogRecord) -> str:
         dt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         fnameline = f"{record.pathname}:{record.lineno}"
         pid_str = f"[PID: {os.getpid()}] " if display_pid else ""
-        return f"{record.levelname} {pid_str}{dt} {fnameline[-15:]:>15} {record.getMessage()}"
+        msg = f"{record.levelname} {pid_str}{dt} {fnameline[-15:]:>15} {record.getMessage()}"
+        if record.exc_info:
+            msg = f"{msg}\n{''.join(traceback.format_exception(*record.exc_info)).rstrip()}"
+        if record.stack_info:
+            msg = f"{msg}\n{str(record.stack_info).rstrip()}"
+        return msg
 
     formatter = logging.Formatter()
     formatter.format = custom_format
