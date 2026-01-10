@@ -14,12 +14,12 @@
 import logging
 from pathlib import Path
 
-import datasets
 import numpy as np
 import pandas as pd
 import pytest
-from datasets import Dataset
 
+import datasets
+from datasets import Dataset
 from lerobot.datasets.utils import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_DATA_FILE_SIZE_IN_MB,

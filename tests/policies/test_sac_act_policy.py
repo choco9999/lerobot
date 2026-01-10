@@ -15,7 +15,9 @@ from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_STATE
 
 
 @pytest.mark.parametrize("batch_size,state_dim,env_dim,action_dim", [(2, 6, 3, 6), (1, 10, 4, 3)])
-def test_sac_act_policy_select_action(tmp_path, batch_size: int, state_dim: int, env_dim: int, action_dim: int):
+def test_sac_act_policy_select_action(
+    tmp_path, batch_size: int, state_dim: int, env_dim: int, action_dim: int
+):
     # 1) Create and save a minimal ACT checkpoint (state + env_state only, no images).
     act_cfg = ACTConfig(
         # minimal transformer sizes for test speed
@@ -123,7 +125,10 @@ def test_sac_act_policy_losses_run(tmp_path):
     batch = {
         ACTION: torch.randn(batch_size, action_dim),
         "reward": torch.randn(batch_size),
-        "state": {OBS_STATE: torch.randn(batch_size, state_dim), OBS_ENV_STATE: torch.randn(batch_size, env_dim)},
+        "state": {
+            OBS_STATE: torch.randn(batch_size, state_dim),
+            OBS_ENV_STATE: torch.randn(batch_size, env_dim),
+        },
         "next_state": {
             OBS_STATE: torch.randn(batch_size, state_dim),
             OBS_ENV_STATE: torch.randn(batch_size, env_dim),

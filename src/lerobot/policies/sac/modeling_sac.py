@@ -31,20 +31,20 @@ import torch.nn.functional as F  # noqa: N812
 from torch import Tensor
 from torch.distributions import MultivariateNormal, TanhTransform, Transform, TransformedDistribution
 
+from lerobot.configs.types import NormalizationMode
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.sac.configuration_sac import SACActConfig, SACConfig, is_image_feature
 from lerobot.policies.utils import get_device_from_parameters
 from lerobot.teleoperators.utils import TeleopEvents
-from lerobot.configs.types import NormalizationMode
 from lerobot.utils.constants import (
     ACTION,
     OBS_ENV_STATE,
     OBS_IMAGE,
     OBS_IMAGES,
     OBS_STATE,
-    POLICY_PREPROCESSOR_DEFAULT_NAME,
     POLICY_POSTPROCESSOR_DEFAULT_NAME,
- )
+    POLICY_PREPROCESSOR_DEFAULT_NAME,
+)
 
 DISCRETE_DIMENSION_INDEX = -1  # Gripper is always the last dimension
 
@@ -308,12 +308,12 @@ class SACPolicy(
             return actions, None
 
         try:
-            action_min = torch.as_tensor(action_stats["min"], device=actions.device, dtype=actions.dtype).view(
-                1, -1
-            )
-            action_max = torch.as_tensor(action_stats["max"], device=actions.device, dtype=actions.dtype).view(
-                1, -1
-            )
+            action_min = torch.as_tensor(
+                action_stats["min"], device=actions.device, dtype=actions.dtype
+            ).view(1, -1)
+            action_max = torch.as_tensor(
+                action_stats["max"], device=actions.device, dtype=actions.dtype
+            ).view(1, -1)
         except Exception:
             return actions, None
 
@@ -529,7 +529,9 @@ class SACPolicy(
                     if isinstance(deterministic_action, Tensor) and deterministic_action.ndim == 2:
                         action_dim = int(deterministic_action.shape[-1])
                         target = actions[:, :action_dim] if actions.shape[-1] >= action_dim else actions
-                        target = target.to(device=deterministic_action.device, dtype=deterministic_action.dtype)
+                        target = target.to(
+                            device=deterministic_action.device, dtype=deterministic_action.dtype
+                        )
                         deterministic_action, _ = self._project_actions_to_max_relative_target(
                             observations=observations,
                             actions=deterministic_action,
@@ -1347,21 +1349,31 @@ class _ACTGaussianActor(nn.Module):
                 "act_residual_mean_abs": torch.tensor(0.0, device=self.log_std.device),
                 "act_residual_max_abs": torch.tensor(0.0, device=self.log_std.device),
             }
-            return torch.zeros((batch, self.log_std.shape[0]), dtype=torch.float32, device=self.log_std.device)
+            return torch.zeros(
+                (batch, self.log_std.shape[0]), dtype=torch.float32, device=self.log_std.device
+            )
 
         state = observations.get(OBS_STATE)
         if not isinstance(state, Tensor):
-            return torch.zeros((batch, self.log_std.shape[0]), dtype=torch.float32, device=self.log_std.device)
+            return torch.zeros(
+                (batch, self.log_std.shape[0]), dtype=torch.float32, device=self.log_std.device
+            )
         if state.ndim == 1:
             state = state.unsqueeze(0)
         if state.ndim != 2:
-            return torch.zeros((batch, self.log_std.shape[0]), dtype=torch.float32, device=self.log_std.device)
+            return torch.zeros(
+                (batch, self.log_std.shape[0]), dtype=torch.float32, device=self.log_std.device
+            )
 
         action_dim = int(self.log_std.shape[0])
         if state.shape[-1] < action_dim:
-            return torch.zeros((batch, self.log_std.shape[0]), dtype=torch.float32, device=self.log_std.device)
+            return torch.zeros(
+                (batch, self.log_std.shape[0]), dtype=torch.float32, device=self.log_std.device
+            )
 
-        state_in = state[:, :action_dim].to(device=self.log_std.device, dtype=torch.float32, non_blocking=True)
+        state_in = state[:, :action_dim].to(
+            device=self.log_std.device, dtype=torch.float32, non_blocking=True
+        )
         # Normalize state to roughly [-1, 1] when action bounds are known (common for joint-space absolute targets).
         if self._action_min is not None and self._action_max is not None:
             try:
@@ -1373,12 +1385,17 @@ class _ACTGaussianActor(nn.Module):
             except Exception:
                 pass
         residual_raw = self.residual_network(state_in)
-        if not isinstance(residual_raw, Tensor) or residual_raw.shape != (state_in.shape[0], self.log_std.shape[0]):
+        if not isinstance(residual_raw, Tensor) or residual_raw.shape != (
+            state_in.shape[0],
+            self.log_std.shape[0],
+        ):
             self._last_residual_stats = {
                 "act_residual_mean_abs": torch.tensor(0.0, device=self.log_std.device),
                 "act_residual_max_abs": torch.tensor(0.0, device=self.log_std.device),
             }
-            return torch.zeros((batch, self.log_std.shape[0]), dtype=torch.float32, device=self.log_std.device)
+            return torch.zeros(
+                (batch, self.log_std.shape[0]), dtype=torch.float32, device=self.log_std.device
+            )
         residual = torch.tanh(residual_raw) * float(self.residual_scale)
         try:
             self._last_residual_stats = {
@@ -1451,7 +1468,7 @@ class _ACTGaussianActor(nn.Module):
         desired = n_action_steps * 2
         if q.maxlen is not None and q.maxlen >= desired:
             return
-        setattr(self.act_policy, "_action_queue", deque(q, maxlen=desired))
+        self.act_policy._action_queue = deque(q, maxlen=desired)
 
     def _prefetch_inflight(self) -> bool:
         t = self._prefetch_thread
@@ -1545,14 +1562,16 @@ class _ACTGaussianActor(nn.Module):
                 actions_seq, _ = act_model(batch)
 
         try:
-            setattr(self.act_policy, "_last_action_chunk", actions_seq)
+            self.act_policy._last_action_chunk = actions_seq
             prev_id = getattr(self.act_policy, "_last_action_chunk_id", 0)
-            setattr(self.act_policy, "_last_action_chunk_id", int(prev_id) + 1)
+            self.act_policy._last_action_chunk_id = int(prev_id) + 1
         except Exception:
             pass
 
         if actions_seq.ndim != 3:
-            raise ValueError(f"Expected ACT to return (B, S, D) actions, got shape {tuple(actions_seq.shape)}")
+            raise ValueError(
+                f"Expected ACT to return (B, S, D) actions, got shape {tuple(actions_seq.shape)}"
+            )
 
         n_action_steps = self._act_n_action_steps()
         if n_action_steps <= 0:
@@ -1619,7 +1638,9 @@ class _ACTGaussianActor(nn.Module):
             if callable(select_action):
                 action = select_action(batch)
                 if not isinstance(action, torch.Tensor):
-                    raise TypeError(f"ACT policy select_action() must return a torch.Tensor, got {type(action)}")
+                    raise TypeError(
+                        f"ACT policy select_action() must return a torch.Tensor, got {type(action)}"
+                    )
                 return action
 
         act_model = getattr(self.act_policy, "model", None)
@@ -1634,13 +1655,15 @@ class _ACTGaussianActor(nn.Module):
         # Best-effort cache of the latest predicted chunk for logging/debugging. This is useful when
         # `use_action_queue` is False (otherwise ACTPolicy.select_action manages chunking internally).
         try:
-            setattr(self.act_policy, "_last_action_chunk", actions_seq)
+            self.act_policy._last_action_chunk = actions_seq
             prev_id = getattr(self.act_policy, "_last_action_chunk_id", 0)
-            setattr(self.act_policy, "_last_action_chunk_id", int(prev_id) + 1)
+            self.act_policy._last_action_chunk_id = int(prev_id) + 1
         except Exception:
             pass
         if actions_seq.ndim != 3:
-            raise ValueError(f"Expected ACT to return (B, S, D) actions, got shape {tuple(actions_seq.shape)}")
+            raise ValueError(
+                f"Expected ACT to return (B, S, D) actions, got shape {tuple(actions_seq.shape)}"
+            )
 
         if not (0 <= self.action_index < actions_seq.shape[1]):
             raise ValueError(
@@ -1789,10 +1812,10 @@ class SACActPolicy(SACPolicy):
         # Load ACT policy on the same device as the SAC policy.
         # Import locally to avoid heavyweight imports unless this policy type is used.
         from lerobot.configs.policies import PreTrainedConfig as _PreTrainedConfig
-        from lerobot.policies.act.modeling_act import ACTPolicy
         from lerobot.policies.act.configuration_act import ACTConfig
-        from lerobot.processor.pipeline import DataProcessorPipeline
+        from lerobot.policies.act.modeling_act import ACTPolicy
         from lerobot.processor.device_processor import DeviceProcessorStep
+        from lerobot.processor.pipeline import DataProcessorPipeline
 
         act_cfg = _PreTrainedConfig.from_pretrained(cfg.act_pretrained_path)
         if act_cfg.type != "act":
@@ -1805,7 +1828,9 @@ class SACActPolicy(SACPolicy):
         act_policy.eval()
 
         act_action_norm_mode = None
-        if isinstance(act_policy.config, ACTConfig) and isinstance(act_policy.config.normalization_mapping, dict):
+        if isinstance(act_policy.config, ACTConfig) and isinstance(
+            act_policy.config.normalization_mapping, dict
+        ):
             act_action_norm_mode = act_policy.config.normalization_mapping.get("ACTION")
 
         # Optional ACT preprocessor (normalization) to match the distribution seen during ACT training.
@@ -1841,7 +1866,11 @@ class SACActPolicy(SACPolicy):
                         step.__post_init__()
             except FileNotFoundError:
                 postprocessor = None
-            if postprocessor is None and act_action_norm_mode is not None and act_action_norm_mode != NormalizationMode.MIN_MAX:
+            if (
+                postprocessor is None
+                and act_action_norm_mode is not None
+                and act_action_norm_mode != NormalizationMode.MIN_MAX
+            ):
                 raise FileNotFoundError(
                     f"{postprocessor_config} not found in {cfg.act_pretrained_path}. "
                     "This ACT checkpoint appears to use an ACTION normalization mode that requires a postprocessor "
@@ -1888,7 +1917,9 @@ class SACActPolicy(SACPolicy):
                 except Exception:
                     state_dim = None
             if state_dim is None:
-                raise ValueError("act_residual_scale>0 requires `observation.state` in policy.input_features.")
+                raise ValueError(
+                    "act_residual_scale>0 requires `observation.state` in policy.input_features."
+                )
 
             hidden_dims = list(getattr(cfg, "act_residual_hidden_dims", [64, 64]))
             layers: list[nn.Module] = []
@@ -1938,7 +1969,9 @@ class SACActPolicy(SACPolicy):
         Otherwise, samples a tanh-Gaussian action centered on the ACT prior (SAC-style).
         """
         cfg: SACActConfig = self.config  # type: ignore[assignment]
-        prior_action = self.actor.prior_action(batch, use_action_queue=getattr(cfg, "act_use_action_queue", False))
+        prior_action = self.actor.prior_action(
+            batch, use_action_queue=getattr(cfg, "act_use_action_queue", False)
+        )
         if getattr(cfg, "act_deterministic_inference", False):
             actions = prior_action
         else:

@@ -51,8 +51,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from pprint import pformat
-from queue import Empty as QueueEmpty
-from queue import Full as QueueFull
+from queue import Empty as QueueEmpty, Full as QueueFull
 
 import grpc
 import torch
@@ -1027,9 +1026,7 @@ def save_training_checkpoint(
                 root=dataset_offline_dir,
             )
     else:
-        logging.info(
-            "[LEARNER] Skipping replay buffer dataset export (save_replay_buffer_dataset=false)."
-        )
+        logging.info("[LEARNER] Skipping replay buffer dataset export (save_replay_buffer_dataset=false).")
 
     logging.info("Resume training")
 
@@ -1073,9 +1070,7 @@ def make_optimizers_and_scheduler(cfg: TrainRLServerPipelineConfig, policy: nn.M
 
         actor_param_groups = []
         if act_policy_params:
-            actor_param_groups.append(
-                {"params": act_policy_params, "lr": cfg.policy.actor_lr * lr_scale}
-            )
+            actor_param_groups.append({"params": act_policy_params, "lr": cfg.policy.actor_lr * lr_scale})
         if other_actor_params:
             actor_param_groups.append({"params": other_actor_params, "lr": cfg.policy.actor_lr})
         optimizer_actor = torch.optim.Adam(params=actor_param_groups)
@@ -1477,6 +1472,7 @@ def process_transitions(
     Returns:
         bool: Updated `prev_intervention` flag for the next call.
     """
+
     def _as_bool(value: object) -> bool:
         if isinstance(value, torch.Tensor):
             if value.numel() != 1:

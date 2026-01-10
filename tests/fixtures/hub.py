@@ -13,11 +13,11 @@
 # limitations under the License.
 from pathlib import Path
 
-import datasets
 import pandas as pd
 import pytest
 from huggingface_hub.utils import filter_repo_objects
 
+import datasets
 from lerobot.datasets.utils import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_DATA_FILE_SIZE_IN_MB,

@@ -28,13 +28,13 @@ import shutil
 from collections.abc import Callable
 from pathlib import Path
 
-import datasets
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 import torch
 from tqdm import tqdm
 
+import datasets
 from lerobot.datasets.aggregate import aggregate_datasets
 from lerobot.datasets.compute_stats import aggregate_stats
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata

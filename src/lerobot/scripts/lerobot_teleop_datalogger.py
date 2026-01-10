@@ -29,7 +29,6 @@ from typing import Any
 from lerobot.configs import parser
 from lerobot.processor import (
     RobotAction,
-    RobotObservation,
     make_default_processors,
 )
 from lerobot.robots import (  # noqa: F401
@@ -243,7 +242,9 @@ def teleop_datalogger_loop(
 
             # 2) Map + send to robot
             proc_t0 = time.perf_counter()
-            teleop_action = teleop_action_processor((action, None))  # observation not needed by default pipeline
+            teleop_action = teleop_action_processor(
+                (action, None)
+            )  # observation not needed by default pipeline
             robot_action_to_send = robot_action_processor((teleop_action, None))
             proc_t1 = time.perf_counter()
             _ = proc_t1  # placeholder for future timing breakdown if needed

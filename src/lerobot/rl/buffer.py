@@ -322,9 +322,7 @@ class ReplayBuffer:
         if candidate_idx.numel() == 0:
             if fallback_to_random:
                 return self.sample(batch_size)
-            raise RuntimeError(
-                f"No transitions matched complementary_info['{key}'] > {threshold}."
-            )
+            raise RuntimeError(f"No transitions matched complementary_info['{key}'] > {threshold}.")
 
         pick = torch.randint(
             low=0,

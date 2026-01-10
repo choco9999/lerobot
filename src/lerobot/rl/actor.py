@@ -46,11 +46,11 @@ For more details on the complete HILSerl training workflow, see:
 https://github.com/michel-aractingi/lerobot-hilserl-guide
 """
 
+import json
 import logging
 import os
 import sys
 import time
-import json
 from functools import lru_cache
 from queue import Empty, Full, Queue as ThreadQueue
 
@@ -79,6 +79,7 @@ from lerobot.transport.utils import (
     send_bytes_in_chunks,
     transitions_to_bytes,
 )
+from lerobot.utils.constants import OBS_IMAGE, OBS_STATE
 from lerobot.utils.random_utils import set_seed
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.transition import (
@@ -86,7 +87,6 @@ from lerobot.utils.transition import (
     move_state_dict_to_device,
     move_transition_to_device,
 )
-from lerobot.utils.constants import OBS_IMAGE, OBS_STATE
 from lerobot.utils.utils import (
     TimerManager,
     get_safe_torch_device,
@@ -262,7 +262,9 @@ def act_with_policy(
     try:
         action_min = None
         action_max = None
-        if getattr(cfg.policy, "dataset_stats", None) is not None and isinstance(cfg.policy.dataset_stats, dict):
+        if getattr(cfg.policy, "dataset_stats", None) is not None and isinstance(
+            cfg.policy.dataset_stats, dict
+        ):
             action_stats = cfg.policy.dataset_stats.get("action", {})
             if isinstance(action_stats, dict):
                 action_min = action_stats.get("min")
@@ -505,13 +507,17 @@ def act_with_policy(
             if not is_prev_intervention:
                 if action_chunk_log_f is not None:
                     act_policy = None
-                    if hasattr(policy, "actor") and hasattr(getattr(policy, "actor"), "act_policy"):
-                        act_policy = getattr(policy.actor, "act_policy")
+                    if hasattr(policy, "actor") and hasattr(policy.actor, "act_policy"):
+                        act_policy = policy.actor.act_policy
                     elif hasattr(policy, "predict_action_chunk"):
                         act_policy = policy
 
-                    chunk = getattr(act_policy, "_last_action_chunk", None) if act_policy is not None else None
-                    chunk_id = getattr(act_policy, "_last_action_chunk_id", None) if act_policy is not None else None
+                    chunk = (
+                        getattr(act_policy, "_last_action_chunk", None) if act_policy is not None else None
+                    )
+                    chunk_id = (
+                        getattr(act_policy, "_last_action_chunk_id", None) if act_policy is not None else None
+                    )
                     if (
                         isinstance(chunk, torch.Tensor)
                         and isinstance(chunk_id, int)
@@ -636,7 +642,11 @@ def act_with_policy(
                 policy_action_t = _as_1d(policy_action if isinstance(policy_action, torch.Tensor) else None)
 
                 delta_max = None
-                if state_t is not None and robot_action_t is not None and state_t.shape == robot_action_t.shape:
+                if (
+                    state_t is not None
+                    and robot_action_t is not None
+                    and state_t.shape == robot_action_t.shape
+                ):
                     delta_max = float((robot_action_t - state_t).abs().max().item())
 
                 move_max = None
@@ -654,7 +664,9 @@ def act_with_policy(
                     and robot_action_t is not None
                     and telemetry_prev_robot_action_t.shape == robot_action_t.shape
                 ):
-                    cmd_change_max = float((robot_action_t - telemetry_prev_robot_action_t).abs().max().item())
+                    cmd_change_max = float(
+                        (robot_action_t - telemetry_prev_robot_action_t).abs().max().item()
+                    )
                 telemetry_prev_robot_action_t = robot_action_t
 
                 def _max_abs(t: torch.Tensor | None) -> float | None:
@@ -723,9 +735,8 @@ def act_with_policy(
                 )
 
                 episode_success: bool | None = None
-                if (
-                    cfg.env.processor.reset is not None
-                    and getattr(cfg.env.processor.reset, "prompt_success_failure", False)
+                if cfg.env.processor.reset is not None and getattr(
+                    cfg.env.processor.reset, "prompt_success_failure", False
                 ):
                     # Keep the terminal transition local until the user provides the outcome label.
                     terminal_transition: Transition | None = None
@@ -861,7 +872,7 @@ def act_with_policy(
                             last_act_queue_len if last_act_queue_len is not None else "n/a",
                             timing,
                         )
-                        setattr(act_with_policy, "_last_slow_step_log_s", now_s)
+                        act_with_policy._last_slow_step_log_s = now_s
                 precise_sleep(max(1 / cfg.env.fps - dt_time, 0.0))
     finally:
         if action_chunk_log_f is not None:
@@ -1230,9 +1241,7 @@ def wait_for_initial_policy_parameters(
     deadline_s = time.monotonic() + max(timeout_s, 0.0)
     while time.monotonic() < deadline_s:
         remaining = max(0.0, deadline_s - time.monotonic())
-        bytes_state_dict = get_last_item_from_queue(
-            parameters_queue, block=True, timeout=min(0.5, remaining)
-        )
+        bytes_state_dict = get_last_item_from_queue(parameters_queue, block=True, timeout=min(0.5, remaining))
         if bytes_state_dict is None:
             continue
         _load_policy_parameters_from_bytes(policy=policy, bytes_state_dict=bytes_state_dict, device=device)
@@ -1274,11 +1283,9 @@ def push_transitions_to_transport_queue(
             transitions_queue.put(payload, block=False)
         except Full:
             if now_s - last_log_s >= 1.0:
-                logging.warning(
-                    "[ACTOR] Transitions queue full; dropping %d transitions.", len(chunk)
-                )
+                logging.warning("[ACTOR] Transitions queue full; dropping %d transitions.", len(chunk))
                 last_log_s = now_s
-                setattr(push_transitions_to_transport_queue, "_last_full_log_s", last_log_s)
+                push_transitions_to_transport_queue._last_full_log_s = last_log_s
         except Exception:  # noqa: BLE001
             logging.exception("[ACTOR] Failed to enqueue transitions; dropping them.")
 

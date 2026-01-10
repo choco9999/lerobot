@@ -152,9 +152,9 @@ class UploadDataset(PipelineStep):
     def run(self, data=None, rank: int = 0, world_size: int = 1):
         import logging
 
-        from datasets.utils.tqdm import disable_progress_bars
         from huggingface_hub import CommitOperationAdd, preupload_lfs_files
 
+        from datasets.utils.tqdm import disable_progress_bars
         from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
         from lerobot.utils.utils import init_logging
 

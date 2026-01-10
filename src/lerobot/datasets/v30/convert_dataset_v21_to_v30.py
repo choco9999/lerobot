@@ -52,10 +52,10 @@ import jsonlines
 import pandas as pd
 import pyarrow as pa
 import tqdm
-from datasets import Dataset, Features, Image
 from huggingface_hub import HfApi, snapshot_download
 from requests import HTTPError
 
+from datasets import Dataset, Features, Image
 from lerobot.datasets.compute_stats import aggregate_stats
 from lerobot.datasets.lerobot_dataset import CODEBASE_VERSION, LeRobotDataset
 from lerobot.datasets.utils import (

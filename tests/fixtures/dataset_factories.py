@@ -18,14 +18,14 @@ from pathlib import Path
 from typing import Protocol
 from unittest.mock import patch
 
-import datasets
 import numpy as np
 import pandas as pd
 import PIL.Image
 import pytest
 import torch
-from datasets import Dataset
 
+import datasets
+from datasets import Dataset
 from lerobot.datasets.lerobot_dataset import CODEBASE_VERSION, LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.datasets.utils import (
     DEFAULT_CHUNK_SIZE,

@@ -496,9 +496,7 @@ class InterventionActionProcessorStep(ProcessorStep):
             if teleop_action is None:
                 obs = transition.get(TransitionKey.OBSERVATION, {})
                 if isinstance(obs, dict):
-                    hold_action = {
-                        k: v for k, v in obs.items() if isinstance(k, str) and k.endswith(".pos")
-                    }
+                    hold_action = {k: v for k, v in obs.items() if isinstance(k, str) and k.endswith(".pos")}
                     teleop_action = hold_action if hold_action else None
                 action_source = "hold" if teleop_action is not None else "none"
             else:
@@ -528,13 +526,13 @@ class InterventionActionProcessorStep(ProcessorStep):
                     obs_keys = []
                     if isinstance(obs, dict):
                         obs_keys = [
-                            k
-                            for k in obs
-                            if isinstance(k, str) and k.endswith(".pos") and k in teleop_action
+                            k for k in obs if isinstance(k, str) and k.endswith(".pos") and k in teleop_action
                         ]
 
-                    joint_keys = obs_keys if obs_keys else sorted(
-                        [k for k in teleop_action if isinstance(k, str) and k.endswith(".pos")]
+                    joint_keys = (
+                        obs_keys
+                        if obs_keys
+                        else sorted([k for k in teleop_action if isinstance(k, str) and k.endswith(".pos")])
                     )
                     action_list = [teleop_action[k] for k in joint_keys]
 
@@ -799,13 +797,11 @@ class MaxRelativeTargetActionProcessorStep(ProcessorStep):
             missing = sorted(motors - keys)
             if unknown:
                 raise ValueError(
-                    "max_relative_target has unknown motors "
-                    f"{unknown}; expected keys={sorted(motors)}"
+                    f"max_relative_target has unknown motors {unknown}; expected keys={sorted(motors)}"
                 )
             if missing:
                 raise ValueError(
-                    "max_relative_target is missing motors "
-                    f"{missing}; expected keys={sorted(motors)}"
+                    f"max_relative_target is missing motors {missing}; expected keys={sorted(motors)}"
                 )
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
@@ -881,8 +877,12 @@ class MaxRelativeTargetActionProcessorStep(ProcessorStep):
         # Keep the action stored for RL aligned with the actual executed action.
         if self.action_min is not None and self.action_max is not None:
             try:
-                action_min = torch.tensor(self.action_min, dtype=clamped_action.dtype, device=clamped_action.device)
-                action_max = torch.tensor(self.action_max, dtype=clamped_action.dtype, device=clamped_action.device)
+                action_min = torch.tensor(
+                    self.action_min, dtype=clamped_action.dtype, device=clamped_action.device
+                )
+                action_max = torch.tensor(
+                    self.action_max, dtype=clamped_action.dtype, device=clamped_action.device
+                )
                 if clamped_action.numel() == action_min.numel():
                     clamped_norm = _minmax_normalize(clamped_action, action_min, action_max).clamp(-1.0, 1.0)
                     complementary_data = new_transition.get(TransitionKey.COMPLEMENTARY_DATA) or {}

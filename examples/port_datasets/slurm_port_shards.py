@@ -34,9 +34,9 @@ class PortDroidShards(PipelineStep):
         self.repo_id = repo_id
 
     def run(self, data=None, rank: int = 0, world_size: int = 1):
-        from datasets.utils.tqdm import disable_progress_bars
         from port_droid import port_droid, validate_dataset
 
+        from datasets.utils.tqdm import disable_progress_bars
         from lerobot.utils.utils import init_logging
 
         init_logging()
