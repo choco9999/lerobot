@@ -78,7 +78,7 @@ from .policy_robot_bridge import (
     RobotActionToPolicyActionProcessorStep,
 )
 from .rename_processor import RenameObservationsProcessorStep
-from .tokenizer_processor import TokenizerProcessorStep
+from .tokenizer_processor import ActionTokenizerProcessorStep, TokenizerProcessorStep
 
 __all__ = [
     "ActionProcessorStep",
@@ -128,6 +128,7 @@ __all__ = [
     "MinMaxUnnormalizeActionProcessorStep",
     "RobotProcessorPipeline",
     "TokenizerProcessorStep",
+    "ActionTokenizerProcessorStep",
     "Torch2NumpyActionProcessorStep",
     "RobotActionToPolicyActionProcessorStep",
     "PolicyActionToRobotActionProcessorStep",
