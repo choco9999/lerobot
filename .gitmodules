@@ -1,0 +1,9 @@
+[submodule ".upstream_hil_serl"]
+	path = .upstream_hil_serl
+	url = https://github.com/rail-berkeley/hil-serl.git
+[submodule "datasets/pusht"]
+	path = datasets/pusht
+	url = https://huggingface.co/datasets/lerobot/pusht
+[submodule "third_party/hil-serl-upstream"]
+	path = third_party/hil-serl-upstream
+	url = https://github.com/rail-berkeley/hil-serl.git
