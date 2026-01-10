@@ -108,4 +108,4 @@ def test_send_action(follower):
     assert returned == action
 
     goal_pos = {m: (i + 1) * 10 for i, m in enumerate(follower.bus.motors)}
-    follower.bus.sync_write.assert_called_once_with("Goal_Position", goal_pos)
+    follower.bus.sync_write.assert_called_once_with("Goal_Position", goal_pos, num_retry=2)

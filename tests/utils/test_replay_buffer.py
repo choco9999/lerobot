@@ -30,6 +30,24 @@ def state_dims() -> list[str]:
     return [OBS_IMAGE, OBS_STATE]
 
 
+def _to_uint8_image(image: torch.Tensor) -> torch.Tensor:
+    if image.dtype == torch.uint8:
+        return image
+    return (image * 255.0).round().clamp(0, 255).to(torch.uint8)
+
+
+def _expected_stored_value(buffer: ReplayBuffer, key: str, value: torch.Tensor) -> torch.Tensor:
+    if buffer.store_images_as_uint8 and key.startswith(OBS_IMAGE):
+        return _to_uint8_image(value)
+    return value
+
+
+def _expected_sample_value(buffer: ReplayBuffer, key: str, value: torch.Tensor) -> torch.Tensor:
+    if buffer.store_images_as_uint8 and key.startswith(OBS_IMAGE):
+        return _to_uint8_image(value).float() / 255.0
+    return value
+
+
 @pytest.fixture
 def replay_buffer() -> ReplayBuffer:
     return create_empty_replay_buffer()
@@ -195,10 +213,11 @@ def test_add_transition(replay_buffer, dummy_state, dummy_action):
     assert not replay_buffer.truncateds[0], "Truncated should be False for the first transition."
 
     for dim in state_dims():
-        assert torch.equal(replay_buffer.states[dim][0], dummy_state[dim]), (
+        expected_state = _expected_stored_value(replay_buffer, dim, dummy_state[dim])
+        assert torch.equal(replay_buffer.states[dim][0], expected_state), (
             "Observation should be equal to the first transition."
         )
-        assert torch.equal(replay_buffer.next_states[dim][0], dummy_state[dim]), (
+        assert torch.equal(replay_buffer.next_states[dim][0], expected_state), (
             "Next observation should be equal to the first transition."
         )
 
@@ -221,10 +240,11 @@ def test_add_over_capacity():
     assert len(replay_buffer) == 2, "Replay buffer should have 2 transitions after adding 3."
 
     for dim in state_dims():
-        assert torch.equal(replay_buffer.states[dim][0], dummy_state_3[dim]), (
+        expected_state = _expected_stored_value(replay_buffer, dim, dummy_state_3[dim])
+        assert torch.equal(replay_buffer.states[dim][0], expected_state), (
             "Observation should be equal to the first transition."
         )
-        assert torch.equal(replay_buffer.next_states[dim][0], dummy_state_3[dim]), (
+        assert torch.equal(replay_buffer.next_states[dim][0], expected_state), (
             "Next observation should be equal to the first transition."
         )
 
@@ -257,11 +277,14 @@ def test_sample_with_1_transition(replay_buffer, dummy_state, next_dummy_state, 
     for buffer_property in dict_properties():
         for k, v in expected_batch_transition[buffer_property].items():
             got_state = got_batch_transition[buffer_property][k]
+            expected_value = _expected_sample_value(replay_buffer, k, v)
 
             assert got_state.shape[0] == 1, f"{k} should have 1 transition."
             assert got_state.device.type == "cpu", f"{k} should be on cpu."
 
-            assert torch.equal(got_state[0], v), f"{k} should be equal to the expected batch transition."
+            assert torch.equal(got_state[0], expected_value), (
+                f"{k} should be equal to the expected batch transition."
+            )
 
     for key, _value in expected_batch_transition.items():
         if key in dict_properties():
@@ -333,11 +356,14 @@ def test_sample_batch(replay_buffer):
     for buffer_property in dict_properties():
         for k in got_batch_transition[buffer_property]:
             got_state = got_batch_transition[buffer_property][k]
+            expected_states = [
+                _expected_sample_value(replay_buffer, k, dummy_state[k]) for dummy_state in dummy_states
+            ]
 
             assert got_state.shape[0] == 3, f"{k} should have 3 transition."
 
             for got_state_item in got_state:
-                assert any(torch.equal(got_state_item, dummy_state[k]) for dummy_state in dummy_states), (
+                assert any(torch.equal(got_state_item, expected) for expected in expected_states), (
                     f"{k} should be equal to one of the dummy states."
                 )
 
@@ -387,7 +413,13 @@ def test_to_lerobot_dataset(tmp_path):
             elif feature == OBS_IMAGE:
                 # Tensor -> numpy is not precise, so we have some diff there
                 # TODO: Check and fix it
-                torch.testing.assert_close(value, buffer.states[OBS_IMAGE][i], rtol=0.3, atol=0.003)
+                expected_image = buffer.states[OBS_IMAGE][i]
+                if buffer.store_images_as_uint8:
+                    expected_image = expected_image.float() / 255.0
+                value_image = value
+                if value_image.dtype == torch.uint8:
+                    value_image = value_image.float() / 255.0
+                torch.testing.assert_close(value_image, expected_image, rtol=0.3, atol=0.003)
             elif feature == OBS_STATE:
                 assert torch.equal(value, buffer.states[OBS_STATE][i])
 
