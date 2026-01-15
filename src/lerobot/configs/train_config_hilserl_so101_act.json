@@ -6,10 +6,10 @@
     "num_workers": 2,
     "batch_size": 32,
     "steps": 100000,
-    "eval_freq": 20000,
+    "eval_freq": 2000,
     "log_freq": 100,
     "save_checkpoint": true,
-    "save_replay_buffer_dataset": false,
+    "save_replay_buffer_dataset": true,
     "save_freq": 500,
     "wandb": {
         "enable": false,
@@ -30,8 +30,8 @@
         "act_action_index": 0,
         "act_init_std": 0.05,
         "act_finetune_lr_scale": 0.01,
-        "act_freeze_backbone": true,
-        "act_residual_scale": 0.1,
+        "act_freeze_backbone": false,
+        "act_residual_scale": 0.5,
         "act_residual_hidden_dims": [
             64,
             64
@@ -80,21 +80,63 @@
         "storage_device": "cpu",
         "use_amp": false,
         "dataset_stats": {
-            "action": {
+            "observation.images.front": {
+                "mean": [
+                    0.485,
+                    0.456,
+                    0.406
+                ],
+                "std": [
+                    0.229,
+                    0.224,
+                    0.225
+                ]
+            },
+            "observation.images.back": {
+                "mean": [
+                    0.485,
+                    0.456,
+                    0.406
+                ],
+                "std": [
+                    0.229,
+                    0.224,
+                    0.225
+                ]
+            },
+            "observation.state": {
                 "min": [
-                    -100.0,
-                    -100.0,
-                    -100.0,
-                    -100.0,
-                    -100.0,
+                    -16.991219,
+                    -97.98951,
+                    -16.734325,
+                    -8.56,
+                    -6.756109,
                     0.0
                 ],
                 "max": [
-                    100.0,
-                    100.0,
-                    100.0,
-                    100.0,
-                    100.0,
+                    10.042001,
+                    -15.20979,
+                    98.64682,
+                    74.72,
+                    26.018208,
+                    100.0
+                ]
+            },
+            "action": {
+                "min": [
+                    -17.561905,
+                    -99.49131,
+                    -19.927372,
+                    -9.362389,
+                    -6.902985,
+                    0.0
+                ],
+                "max": [
+                    10.32381,
+                    -15.727003,
+                    99.636856,
+                    74.89911,
+                    26.772388,
                     100.0
                 ]
             }
@@ -112,9 +154,9 @@
         "success_replay_buffer_capacity": 1000,
         "max_relative_target": 20.0,
         "max_relative_target_violation_penalty": 5.0,
-        "intervention_bc_loss_weight": 0.1,
+        "intervention_bc_loss_weight": 1.0,
         "require_human_buffer_for_actor_update": true,
-        "online_step_before_learning": 1000,
+        "online_step_before_learning": 100,
         "min_positive_reward_transitions_before_actor_update": 50,
         "policy_update_freq": 4,
         "discount": 0.99,

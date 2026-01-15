@@ -1,7 +1,7 @@
 [前準備]
-cd lerobot
 conda activate lerobot
 source lerobot-kin-env/bin/activate
+
 sudo chmod 777 -R /dev
 
 [動かすだけ]
