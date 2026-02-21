@@ -33,6 +33,7 @@ Notes:
 """
 
 import builtins
+import logging
 import os
 from collections import deque
 from pathlib import Path
@@ -40,6 +41,8 @@ from typing import TypeVar
 
 import torch
 from torch import Tensor
+
+logger = logging.getLogger(__name__)
 
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.policies.groot.configuration_groot import GrootConfig
@@ -166,7 +169,12 @@ class GrootPolicy(PreTrainedPolicy):
                     is_finetuned_checkpoint = True
                 except HfHubHTTPError:
                     is_finetuned_checkpoint = False
-        except Exception:
+        except Exception as e:
+            # Catch unexpected errors during checkpoint detection
+            logger.warning(
+                f"Unexpected error checking for finetuned checkpoint: {type(e).__name__}: {e}. "
+                "Assuming not a finetuned checkpoint."
+            )
             is_finetuned_checkpoint = False
 
         if is_finetuned_checkpoint:

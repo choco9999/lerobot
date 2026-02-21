@@ -360,7 +360,7 @@ class LeKiwi(Robot):
         # Capture images from cameras
         for cam_key, cam in self.cameras.items():
             start = time.perf_counter()
-            obs_dict[cam_key] = cam.async_read()
+            obs_dict[cam_key] = cam.read_latest()
             dt_ms = (time.perf_counter() - start) * 1e3
             logger.debug(f"{self} read {cam_key}: {dt_ms:.1f}ms")
 
@@ -409,9 +409,30 @@ class LeKiwi(Robot):
 
     @check_if_not_connected
     def disconnect(self):
-        self.stop_base()
-        self.bus.disconnect(self.config.disable_torque_on_disconnect)
-        for cam in self.cameras.values():
-            cam.disconnect()
+        # Collect errors but continue disconnecting all resources
+        errors = []
 
-        logger.info(f"{self} disconnected.")
+        try:
+            self.stop_base()
+        except Exception as e:
+            errors.append(f"Failed to stop base motors: {type(e).__name__}: {e}")
+            logger.error(errors[-1])
+
+        try:
+            self.bus.disconnect(self.config.disable_torque_on_disconnect)
+        except Exception as e:
+            errors.append(f"Failed to disconnect motor bus: {type(e).__name__}: {e}")
+            logger.error(errors[-1])
+
+        # Disconnect all cameras, even if some fail
+        for cam_name, cam in self.cameras.items():
+            try:
+                cam.disconnect()
+            except Exception as e:
+                errors.append(f"Failed to disconnect camera '{cam_name}': {type(e).__name__}: {e}")
+                logger.error(errors[-1])
+
+        if errors:
+            logger.warning(f"{self} disconnected with {len(errors)} error(s)")
+        else:
+            logger.info(f"{self} disconnected.")

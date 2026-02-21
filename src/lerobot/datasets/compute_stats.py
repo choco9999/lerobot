@@ -51,6 +51,10 @@ class RunningQuantileStats:
         Args:
             batch: An array where all dimensions except the last are batch dimensions.
         """
+        # Validate batch has at least 1 dimension
+        if batch.ndim == 0:
+            raise ValueError("Batch must be at least 1-dimensional, got 0-dimensional (scalar)")
+
         batch = batch.reshape(-1, batch.shape[-1])
         num_elements, vector_length = batch.shape
 

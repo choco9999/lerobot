@@ -14,9 +14,12 @@
 
 import abc
 import builtins
+import logging
 from pathlib import Path
 
 import draccus
+
+logger = logging.getLogger(__name__)
 
 from lerobot.motors import MotorCalibration
 from lerobot.processor import RobotAction, RobotObservation
@@ -81,8 +84,9 @@ class Robot(abc.ABC):
         try:
             if self.is_connected:
                 self.disconnect()
-        except Exception:  # nosec B110
-            pass
+        except Exception as e:  # nosec B110
+            # Log but don't raise in destructor to avoid potential issues during cleanup
+            logger.warning(f"Failed to disconnect robot in destructor: {type(e).__name__}: {e}")
 
     # TODO(aliberts): create a proper Feature class for this that links with datasets
     @property

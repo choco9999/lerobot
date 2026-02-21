@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import functools
+import logging
 from collections.abc import Callable, Sequence
 from contextlib import suppress
 from typing import TypedDict
@@ -22,6 +23,8 @@ from typing import TypedDict
 import torch
 import torch.nn.functional as F  # noqa: N812
 from tqdm import tqdm
+
+logger = logging.getLogger(__name__)
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.utils.constants import ACTION, DONE, OBS_IMAGE, REWARD
@@ -363,8 +366,9 @@ class ReplayBuffer:
                 except queue.Full:
                     # Queue is full – loop again (will re-check shutdown_event)
                     continue
-                except Exception:
+                except Exception as e:
                     # Surface any unexpected error and terminate the producer.
+                    logger.error(f"Unexpected error in buffer producer thread: {type(e).__name__}: {e}", exc_info=True)
                     shutdown_event.set()
 
         producer_thread = threading.Thread(target=producer, daemon=True)
@@ -374,10 +378,14 @@ class ReplayBuffer:
             while not shutdown_event.is_set():
                 try:
                     yield data_queue.get(block=True)
-                except Exception:
+                except Exception as e:
                     # If the producer already set the shutdown flag we exit.
                     if shutdown_event.is_set():
+                        logger.debug("Buffer consumer exiting due to shutdown event")
                         break
+                    # Log unexpected exceptions
+                    logger.error(f"Unexpected error in buffer consumer: {type(e).__name__}: {e}", exc_info=True)
+                    break
         finally:
             shutdown_event.set()
             # Drain the queue quickly to help the thread exit if it's blocked on `put`.

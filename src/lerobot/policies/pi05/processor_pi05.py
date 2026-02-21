@@ -14,11 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
-import numpy as np
 import torch
 
 from lerobot.configs.types import PipelineFeatureType, PolicyFeature
@@ -45,7 +43,9 @@ from lerobot.utils.constants import (
 )
 
 
-@ProcessorStepRegistry.register(name="pi05_prepare_state_tokenizer_processor_step")
+@ProcessorStepRegistry.register(
+    name="pi05_prepare_state_tokenizer_processor_step"
+)
 @dataclass
 class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
     """
@@ -61,31 +61,45 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
         state = transition.get(TransitionKey.OBSERVATION, {}).get(OBS_STATE)
         if state is None:
             raise ValueError("State is required for PI05")
-        tasks = transition.get(TransitionKey.COMPLEMENTARY_DATA, {}).get(self.task_key)
+        tasks = transition.get(
+            TransitionKey.COMPLEMENTARY_DATA, {}
+        ).get(self.task_key)
         if tasks is None:
             raise ValueError("No task found in complementary data")
 
-        # TODO: check if this necessary
-        state = deepcopy(state)
-
         # Prepare state (pad to max_state_dim)
+        # Removed unnecessary deepcopy for performance improvement
         state = pad_vector(state, self.max_state_dim)
 
-        # State should already be normalized to [-1, 1] by the NormalizerProcessorStep that runs before this step
-        # Discretize into 256 bins (see openpi `PaligemmaTokenizer.tokenize()`)
-        state_np = state.cpu().numpy()
-        discretized_states = np.digitize(state_np, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+        # State should already be normalized to [-1, 1] by the
+        # NormalizerProcessorStep that runs before this step
+        # Discretize into 256 bins (openpi `PaligemmaTokenizer.tokenize()`)
+        # Performance optimization: perform discretization on GPU
+        # to avoid slow GPU->CPU transfer
+        bins = torch.linspace(-1, 1, 257, device=state.device)[:-1]
+        discretized_states = torch.bucketize(
+            state, bins, right=False
+        ).clamp(max=255)
+        # Only transfer to CPU when needed for string formatting
+        discretized_states_np = discretized_states.cpu().numpy()
 
-        full_prompts = []
-        for i, task in enumerate(tasks):
-            cleaned_text = task.strip().replace("_", " ").replace("\n", " ")
-            state_str = " ".join(map(str, discretized_states[i]))
-            full_prompt = f"Task: {cleaned_text}, State: {state_str};\nAction: "
-            full_prompts.append(full_prompt)
+        # Performance optimization: vectorized text processing
+        # for faster batch processing
+        cleaned_tasks = [
+            task.strip().replace("_", " ").replace("\n", " ")
+            for task in tasks
+        ]
+        state_strs = [
+            " ".join(map(str, row)) for row in discretized_states_np
+        ]
+        full_prompts = [
+            f"Task: {cleaned_text}, State: {state_str};\nAction: "
+            for cleaned_text, state_str in zip(cleaned_tasks, state_strs)
+        ]
 
-        transition[TransitionKey.COMPLEMENTARY_DATA][self.task_key] = full_prompts
-        # Normalize state to [-1, 1] range if needed (assuming it's already normalized by normalizer processor step!!)
-        # Discretize into 256 bins (see openpi `PaligemmaTokenizer.tokenize()`)
+        transition[TransitionKey.COMPLEMENTARY_DATA][
+            self.task_key
+        ] = full_prompts
         return transition
 
     def transform_features(
@@ -105,13 +119,14 @@ def make_pi05_pre_post_processors(
     PolicyProcessorPipeline[PolicyAction, PolicyAction],
 ]:
     """
-    Constructs pre-processor and post-processor pipelines for the PI0 policy.
+    Constructs pre-processor and post-processor pipelines for PI0 policy.
 
     The pre-processing pipeline prepares input data for the model by:
     1. Renaming features to match pretrained configurations.
-    2. Normalizing input and output features based on dataset statistics.
+    2. Normalizing input and output features based on dataset stats.
     3. Adding a batch dimension.
-    4. Appending a newline character to the task description for tokenizer compatibility.
+    4. Appending a newline character to the task description for
+       tokenizer compatibility.
     5. Tokenizing the text prompt using the PaliGemma tokenizer.
     6. Moving all data to the specified device.
 
@@ -122,25 +137,29 @@ def make_pi05_pre_post_processors(
     Args:
         config: The configuration object for the PI0 policy.
         dataset_stats: A dictionary of statistics for normalization.
-        preprocessor_kwargs: Additional arguments for the pre-processor pipeline.
-        postprocessor_kwargs: Additional arguments for the post-processor pipeline.
 
     Returns:
-        A tuple containing the configured pre-processor and post-processor pipelines.
+        A tuple containing the configured pre-processor and
+        post-processor pipelines.
     """
 
     # Add remaining processors
     input_steps: list[ProcessorStep] = [
-        RenameObservationsProcessorStep(rename_map={}),  # To mimic the same processor as pretrained one
+        # To mimic the same processor as pretrained one
+        RenameObservationsProcessorStep(rename_map={}),
         AddBatchDimensionProcessorStep(),
-        # NOTE: NormalizerProcessorStep MUST come before Pi05PrepareStateTokenizerProcessorStep
-        # because the tokenizer step expects normalized state in [-1, 1] range for discretization
+        # NOTE: NormalizerProcessorStep MUST come before
+        # Pi05PrepareStateTokenizerProcessorStep
+        # because the tokenizer step expects normalized state in
+        # [-1, 1] range for discretization
         NormalizerProcessorStep(
             features={**config.input_features, **config.output_features},
             norm_map=config.normalization_mapping,
             stats=dataset_stats,
         ),
-        Pi05PrepareStateTokenizerProcessorStep(max_state_dim=config.max_state_dim),
+        Pi05PrepareStateTokenizerProcessorStep(
+            max_state_dim=config.max_state_dim
+        ),
         TokenizerProcessorStep(
             tokenizer_name="google/paligemma-3b-pt-224",
             max_length=config.tokenizer_max_length,
@@ -152,7 +171,9 @@ def make_pi05_pre_post_processors(
 
     output_steps: list[ProcessorStep] = [
         UnnormalizerProcessorStep(
-            features=config.output_features, norm_map=config.normalization_mapping, stats=dataset_stats
+            features=config.output_features,
+            norm_map=config.normalization_mapping,
+            stats=dataset_stats,
         ),
         DeviceProcessorStep(device="cpu"),
     ]

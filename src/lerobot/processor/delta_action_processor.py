@@ -46,6 +46,16 @@ class MapTensorToDeltaActionDictStep(ActionProcessorStep):
         if action.dim() > 1:
             action = action.squeeze(0)
 
+        # Validate action has the required number of elements
+        expected_len = 4 if self.use_gripper else 3
+        action_len = action.shape[0] if hasattr(action, "shape") else len(action)
+        if action_len < expected_len:
+            raise ValueError(
+                f"Action tensor must have at least {expected_len} elements "
+                f"(delta_x, delta_y, delta_z{', gripper' if self.use_gripper else ''}), "
+                f"got {action_len} elements"
+            )
+
         # TODO (maractingi): add rotation
         delta_action = {
             "delta_x": action[0].item(),

@@ -15,12 +15,15 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
+import logging
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
 from einops import rearrange
 from PIL import Image
+
+logger = logging.getLogger(__name__)
 
 from lerobot.utils.import_utils import _transformers_available
 
@@ -125,7 +128,16 @@ def make_groot_pre_post_processors(
     # Determine env action dimension from config (simple, object-like PolicyFeature)
     try:
         env_action_dim = int(config.output_features[ACTION].shape[0])
-    except Exception:
+    except (KeyError, AttributeError, IndexError, TypeError) as e:
+        # Action dimension not available in config, default to 0
+        logger.warning(
+            f"Failed to extract action dimension from config: {type(e).__name__}: {e}. "
+            "Defaulting to env_action_dim=0"
+        )
+        env_action_dim = 0
+    except Exception as e:
+        # Catch unexpected exceptions
+        logger.error(f"Unexpected error accessing config.output_features: {type(e).__name__}: {e}")
         env_action_dim = 0
 
     input_steps: list[ProcessorStep] = [

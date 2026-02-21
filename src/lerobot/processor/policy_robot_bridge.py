@@ -32,8 +32,14 @@ class RobotActionToPolicyActionProcessorStep(ActionProcessorStep):
     motor_names: list[str]
 
     def action(self, action: RobotAction) -> PolicyAction:
+        if not isinstance(action, dict):
+            raise TypeError(f"Expected action to be a dict, got {type(action).__name__}")
         if len(self.motor_names) != len(action):
             raise ValueError(f"Action must have {len(self.motor_names)} elements, got {len(action)}")
+        # Validate all required keys exist before accessing
+        missing_keys = [f"{name}.pos" for name in self.motor_names if f"{name}.pos" not in action]
+        if missing_keys:
+            raise KeyError(f"Missing required motor position keys in action: {missing_keys}")
         return torch.tensor([action[f"{name}.pos"] for name in self.motor_names])
 
     def get_config(self) -> dict[str, Any]:
@@ -54,8 +60,18 @@ class PolicyActionToRobotActionProcessorStep(ActionProcessorStep):
     motor_names: list[str]
 
     def action(self, action: PolicyAction) -> RobotAction:
-        if len(self.motor_names) != len(action):
-            raise ValueError(f"Action must have {len(self.motor_names)} elements, got {len(action)}")
+        # Validate action is a sequence-like object (list, tuple, tensor, etc.)
+        if not hasattr(action, "__len__") or not hasattr(action, "__getitem__"):
+            raise TypeError(
+                f"Expected action to be a sequence-like object (list, tuple, tensor), got {type(action).__name__}"
+            )
+        action_len = len(action)
+        expected_len = len(self.motor_names)
+        if expected_len != action_len:
+            raise ValueError(
+                f"Action length mismatch: expected {expected_len} elements for motors {self.motor_names}, "
+                f"got {action_len} elements"
+            )
         return {f"{name}.pos": action[i] for i, name in enumerate(self.motor_names)}
 
     def get_config(self) -> dict[str, Any]:

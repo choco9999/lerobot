@@ -14,10 +14,13 @@
 
 import abc
 import builtins
+import logging
 from pathlib import Path
 from typing import Any
 
 import draccus
+
+logger = logging.getLogger(__name__)
 
 from lerobot.motors.motors_bus import MotorCalibration
 from lerobot.processor import RobotAction
@@ -81,8 +84,9 @@ class Teleoperator(abc.ABC):
         try:
             if self.is_connected:
                 self.disconnect()
-        except Exception:  # nosec B110
-            pass
+        except Exception as e:  # nosec B110
+            # Log but don't raise in destructor to avoid potential issues during cleanup
+            logger.warning(f"Failed to disconnect teleoperator in destructor: {type(e).__name__}: {e}")
 
     @property
     @abc.abstractmethod

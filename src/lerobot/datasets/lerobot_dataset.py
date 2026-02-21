@@ -57,6 +57,7 @@ from lerobot.datasets.utils import (
     load_info,
     load_nested_dataset,
     load_stats,
+    load_subtasks,
     load_tasks,
     update_chunk_file_indices,
     validate_episode_buffer,
@@ -76,6 +77,8 @@ from lerobot.datasets.video_utils import (
     get_video_info,
 )
 from lerobot.utils.constants import HF_LEROBOT_HOME
+
+logger = logging.getLogger(__name__)
 
 CODEBASE_VERSION = "v3.0"
 VALID_VIDEO_CODECS = {"h264", "hevc", "libsvtav1"}
@@ -162,6 +165,7 @@ class LeRobotDatasetMetadata:
         self.info = load_info(self.root)
         check_version_compatibility(self.repo_id, self._version, CODEBASE_VERSION)
         self.tasks = load_tasks(self.root)
+        self.subtasks = load_subtasks(self.root)
         self.episodes = load_episodes(self.root)
         self.stats = load_stats(self.root)
 
@@ -518,6 +522,7 @@ class LeRobotDatasetMetadata:
         _validate_feature_names(features)
 
         obj.tasks = None
+        obj.subtasks = None
         obj.episodes = None
         obj.stats = None
         obj.info = create_empty_dataset_info(
@@ -653,7 +658,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             repo_id (str): This is the repo id that will be used to fetch the dataset. Locally, the dataset
                 will be stored under root/repo_id.
             root (Path | None, optional): Local directory to use for downloading/writing files. You can also
-                set the LEROBOT_HOME environment variable to point to a different location. Defaults to
+                set the HF_LEROBOT_HOME environment variable to point to a different location. Defaults to
                 '~/.cache/huggingface/lerobot'.
             episodes (list[int] | None, optional): If specified, this will only load episodes specified by
                 their episode_index in this list. Defaults to None.
@@ -1007,8 +1012,18 @@ class LeRobotDataset(torch.utils.data.Dataset):
             )
             try:
                 result[key] = torch.stack(self.hf_dataset[key][relative_indices])
-            except (KeyError, TypeError, IndexError):
-                result[key] = torch.stack(self.hf_dataset[relative_indices][key])
+            except (KeyError, TypeError, IndexError) as e:
+                # Try alternative indexing approach
+                try:
+                    result[key] = torch.stack(self.hf_dataset[relative_indices][key])
+                except Exception as fallback_error:
+                    # Log both attempts for debugging
+                    logger.error(
+                        f"Failed to load key '{key}' with both indexing approaches. "
+                        f"First error: {type(e).__name__}: {e}. "
+                        f"Second error: {type(fallback_error).__name__}: {fallback_error}"
+                    )
+                    raise
         return result
 
     def _query_videos(self, query_timestamps: dict[str, list[float]], ep_idx: int) -> dict[str, torch.Tensor]:
@@ -1075,6 +1090,12 @@ class LeRobotDataset(torch.utils.data.Dataset):
         # Add task as a string
         task_idx = item["task_index"].item()
         item["task"] = self.meta.tasks.iloc[task_idx].name
+
+        # add subtask information if available
+        if "subtask_index" in self.features and self.meta.subtasks is not None:
+            subtask_idx = item["subtask_index"].item()
+            item["subtask"] = self.meta.subtasks.iloc[subtask_idx].name
+
         return item
 
     def __repr__(self):

@@ -593,82 +593,93 @@ def _keep_episodes_from_video_with_av(
         raise ValueError("No episodes to keep")
 
     in_container = av.open(str(input_path))
+    out = None
 
-    # Check if video stream exists.
-    if not in_container.streams.video:
-        raise ValueError(
-            f"No video streams found in {input_path}. "
-            "The video file may be corrupted or empty. "
-            "Try re-downloading the dataset or checking the video file."
-        )
+    try:
+        # Check if video stream exists.
+        if not in_container.streams.video:
+            raise ValueError(
+                f"No video streams found in {input_path}. "
+                "The video file may be corrupted or empty. "
+                "Try re-downloading the dataset or checking the video file."
+            )
 
-    v_in = in_container.streams.video[0]
+        v_in = in_container.streams.video[0]
 
-    out = av.open(str(output_path), mode="w")
+        out = av.open(str(output_path), mode="w")
 
-    # Convert fps to Fraction for PyAV compatibility.
-    fps_fraction = Fraction(fps).limit_denominator(1000)
-    v_out = out.add_stream(vcodec, rate=fps_fraction)
+        # Convert fps to Fraction for PyAV compatibility.
+        fps_fraction = Fraction(fps).limit_denominator(1000)
+        v_out = out.add_stream(vcodec, rate=fps_fraction)
 
-    # PyAV type stubs don't distinguish video streams from audio/subtitle streams.
-    v_out.width = v_in.codec_context.width
-    v_out.height = v_in.codec_context.height
-    v_out.pix_fmt = pix_fmt
+        # PyAV type stubs don't distinguish video streams from audio/subtitle streams.
+        v_out.width = v_in.codec_context.width
+        v_out.height = v_in.codec_context.height
+        v_out.pix_fmt = pix_fmt
 
-    # Set time_base to match the frame rate for proper timestamp handling.
-    v_out.time_base = Fraction(1, int(fps))
+        # Set time_base to match the frame rate for proper timestamp handling.
+        v_out.time_base = Fraction(1, int(fps))
 
-    out.start_encoding()
+        out.start_encoding()
 
-    # Create set of (start, end) ranges for fast lookup.
-    # Convert to a sorted list for efficient checking.
-    time_ranges = sorted(episodes_to_keep)
+        # Create set of (start, end) ranges for fast lookup.
+        # Convert to a sorted list for efficient checking.
+        time_ranges = sorted(episodes_to_keep)
 
-    # Track frame index for setting PTS and current range being processed.
-    frame_count = 0
-    range_idx = 0
+        # Track frame index for setting PTS and current range being processed.
+        frame_count = 0
+        range_idx = 0
 
-    # Read through entire video once and filter frames.
-    for packet in in_container.demux(v_in):
-        for frame in packet.decode():
-            if frame is None:
-                continue
+        # Read through entire video once and filter frames.
+        for packet in in_container.demux(v_in):
+            for frame in packet.decode():
+                if frame is None:
+                    continue
 
-            # Get frame timestamp.
-            frame_time = float(frame.pts * frame.time_base) if frame.pts is not None else 0.0
+                # Get frame timestamp.
+                frame_time = float(frame.pts * frame.time_base) if frame.pts is not None else 0.0
 
-            # Check if frame is in any of our desired time ranges.
-            # Skip ranges that have already passed.
-            while range_idx < len(time_ranges) and frame_time >= time_ranges[range_idx][1]:
-                range_idx += 1
+                # Check if frame is in any of our desired time ranges.
+                # Skip ranges that have already passed.
+                while range_idx < len(time_ranges) and frame_time >= time_ranges[range_idx][1]:
+                    range_idx += 1
 
-            # If we've passed all ranges, stop processing.
-            if range_idx >= len(time_ranges):
-                break
+                # If we've passed all ranges, stop processing.
+                if range_idx >= len(time_ranges):
+                    break
 
-            # Check if frame is in current range.
-            start_ts, end_ts = time_ranges[range_idx]
-            if frame_time < start_ts:
-                continue
+                # Check if frame is in current range.
+                start_ts, end_ts = time_ranges[range_idx]
+                if frame_time < start_ts:
+                    continue
 
-            # Frame is in range - create a new frame with reset timestamps.
-            # We need to create a copy to avoid modifying the original.
-            new_frame = frame.reformat(width=v_out.width, height=v_out.height, format=v_out.pix_fmt)
-            new_frame.pts = frame_count
-            new_frame.time_base = Fraction(1, int(fps))
+                # Frame is in range - create a new frame with reset timestamps.
+                # We need to create a copy to avoid modifying the original.
+                new_frame = frame.reformat(width=v_out.width, height=v_out.height, format=v_out.pix_fmt)
+                new_frame.pts = frame_count
+                new_frame.time_base = Fraction(1, int(fps))
 
-            # Encode and mux the frame.
-            for pkt in v_out.encode(new_frame):
-                out.mux(pkt)
+                # Encode and mux the frame.
+                for pkt in v_out.encode(new_frame):
+                    out.mux(pkt)
 
-            frame_count += 1
+                frame_count += 1
 
-    # Flush encoder.
-    for pkt in v_out.encode():
-        out.mux(pkt)
+        # Flush encoder.
+        for pkt in v_out.encode():
+            out.mux(pkt)
 
-    out.close()
-    in_container.close()
+    finally:
+        # Ensure resources are always closed, even on exception
+        if out is not None:
+            try:
+                out.close()
+            except Exception:
+                pass  # Already handling an exception, don't mask it
+        try:
+            in_container.close()
+        except Exception:
+            pass  # Already handling an exception, don't mask it
 
 
 def _copy_and_reindex_videos(
@@ -1394,6 +1405,132 @@ def _copy_data_without_images(
 # Video conversion constants
 BYTES_PER_KIB = 1024
 BYTES_PER_MIB = BYTES_PER_KIB * BYTES_PER_KIB
+
+
+def modify_tasks(
+    dataset: LeRobotDataset,
+    new_task: str | None = None,
+    episode_tasks: dict[int, str] | None = None,
+) -> LeRobotDataset:
+    """Modify tasks in a LeRobotDataset.
+
+    This function allows you to either:
+    1. Set a single task for the entire dataset (using `new_task`)
+    2. Set specific tasks for specific episodes (using `episode_tasks`)
+
+    You can combine both: `new_task` sets the default, and `episode_tasks` overrides
+    specific episodes.
+
+    The dataset is modified in-place, updating only the task-related files:
+    - meta/tasks.parquet
+    - data/**/*.parquet (task_index column)
+    - meta/episodes/**/*.parquet (tasks column)
+    - meta/info.json (total_tasks)
+
+    Args:
+        dataset: The source LeRobotDataset to modify.
+        new_task: A single task string to apply to all episodes. If None and episode_tasks
+            is also None, raises an error.
+        episode_tasks: Optional dict mapping episode indices to their task strings.
+            Overrides `new_task` for specific episodes.
+
+
+    Examples:
+        Set a single task for all episodes:
+            dataset = modify_tasks(dataset, new_task="Pick up the cube")
+
+        Set different tasks for specific episodes:
+            dataset = modify_tasks(
+                dataset,
+                episode_tasks={0: "Task A", 1: "Task B", 2: "Task A"}
+            )
+
+        Set a default task with overrides:
+            dataset = modify_tasks(
+                dataset,
+                new_task="Default task",
+                episode_tasks={5: "Special task for episode 5"}
+            )
+    """
+    if new_task is None and episode_tasks is None:
+        raise ValueError("Must specify at least one of new_task or episode_tasks")
+
+    if episode_tasks is not None:
+        valid_indices = set(range(dataset.meta.total_episodes))
+        invalid = set(episode_tasks.keys()) - valid_indices
+        if invalid:
+            raise ValueError(f"Invalid episode indices: {invalid}")
+
+    # Ensure episodes metadata is loaded
+    if dataset.meta.episodes is None:
+        dataset.meta.episodes = load_episodes(dataset.root)
+
+    # Build the mapping from episode index to task string
+    episode_to_task: dict[int, str] = {}
+    for ep_idx in range(dataset.meta.total_episodes):
+        if episode_tasks and ep_idx in episode_tasks:
+            episode_to_task[ep_idx] = episode_tasks[ep_idx]
+        elif new_task is not None:
+            episode_to_task[ep_idx] = new_task
+        else:
+            # Keep original task if not overridden and no default provided
+            original_tasks = dataset.meta.episodes[ep_idx]["tasks"]
+            if not original_tasks:
+                raise ValueError(f"Episode {ep_idx} has no tasks and no default task was provided")
+            episode_to_task[ep_idx] = original_tasks[0]
+
+    # Collect all unique tasks and create new task mapping
+    unique_tasks = sorted(set(episode_to_task.values()))
+    new_task_df = pd.DataFrame({"task_index": list(range(len(unique_tasks)))}, index=unique_tasks)
+    task_to_index = {task: idx for idx, task in enumerate(unique_tasks)}
+
+    logging.info(f"Modifying tasks in {dataset.repo_id}")
+    logging.info(f"New tasks: {unique_tasks}")
+
+    root = dataset.root
+
+    # Update data files - modify task_index column
+    logging.info("Updating data files...")
+    data_dir = root / DATA_DIR
+
+    for parquet_path in tqdm(sorted(data_dir.rglob("*.parquet")), desc="Updating data"):
+        df = pd.read_parquet(parquet_path)
+
+        # Build a mapping from episode_index to new task_index for rows in this file
+        episode_indices_in_file = df["episode_index"].unique()
+        ep_to_new_task_idx = {
+            ep_idx: task_to_index[episode_to_task[ep_idx]] for ep_idx in episode_indices_in_file
+        }
+
+        # Update task_index column
+        df["task_index"] = df["episode_index"].map(ep_to_new_task_idx)
+        df.to_parquet(parquet_path, index=False)
+
+    # Update episodes metadata - modify tasks column
+    logging.info("Updating episodes metadata...")
+    episodes_dir = root / "meta" / "episodes"
+
+    for parquet_path in tqdm(sorted(episodes_dir.rglob("*.parquet")), desc="Updating episodes"):
+        df = pd.read_parquet(parquet_path)
+
+        # Update tasks column
+        df["tasks"] = df["episode_index"].apply(lambda ep_idx: [episode_to_task[ep_idx]])
+        df.to_parquet(parquet_path, index=False)
+
+    # Write new tasks.parquet
+    write_tasks(new_task_df, root)
+
+    # Update info.json
+    dataset.meta.info["total_tasks"] = len(unique_tasks)
+    write_info(dataset.meta.info, root)
+
+    # Reload metadata to reflect changes
+    dataset.meta.tasks = new_task_df
+    dataset.meta.episodes = load_episodes(root)
+
+    logging.info(f"Tasks: {unique_tasks}")
+
+    return dataset
 
 
 def convert_image_to_video_dataset(

@@ -231,11 +231,18 @@ def log_say(text: str, play_sounds: bool = True, blocking: bool = False):
 
 
 def get_channel_first_image_shape(image_shape: tuple) -> tuple:
+    # Validate image_shape has exactly 3 elements
+    if not isinstance(image_shape, (tuple, list)) or len(image_shape) != 3:
+        raise ValueError(
+            f"image_shape must be a tuple or list with exactly 3 elements (height, width, channels), "
+            f"got {type(image_shape).__name__} with {len(image_shape) if hasattr(image_shape, '__len__') else 'unknown'} elements"
+        )
+
     shape = copy(image_shape)
     if shape[2] < shape[0] and shape[2] < shape[1]:  # (h, w, c) -> (c, h, w)
         shape = (shape[2], shape[0], shape[1])
     elif not (shape[0] < shape[1] and shape[0] < shape[2]):
-        raise ValueError(image_shape)
+        raise ValueError(f"Invalid image shape format: {image_shape}")
 
     return shape
 
