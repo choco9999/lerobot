@@ -624,24 +624,14 @@ def _keep_episodes_from_video_with_av(
 
         out.start_encoding()
 
-<<<<<<< HEAD
         # Create set of (start, end) ranges for fast lookup.
         # Convert to a sorted list for efficient checking.
-        time_ranges = sorted(episodes_to_keep)
+        frame_ranges = sorted(episodes_to_keep)
 
         # Track frame index for setting PTS and current range being processed.
+        src_frame_count = 0
         frame_count = 0
         range_idx = 0
-=======
-    # Create set of (start, end) ranges for fast lookup.
-    # Convert to a sorted list for efficient checking.
-    frame_ranges = sorted(episodes_to_keep)
-
-    # Track frame index for setting PTS and current range being processed.
-    src_frame_count = 0
-    frame_count = 0
-    range_idx = 0
->>>>>>> upstream/main
 
         # Read through entire video once and filter frames.
         for packet in in_container.demux(v_in):
@@ -649,40 +639,21 @@ def _keep_episodes_from_video_with_av(
                 if frame is None:
                     continue
 
-<<<<<<< HEAD
-                # Get frame timestamp.
-                frame_time = float(frame.pts * frame.time_base) if frame.pts is not None else 0.0
-
-                # Check if frame is in any of our desired time ranges.
+                # Check if frame is in any of our desired frame ranges.
                 # Skip ranges that have already passed.
-                while range_idx < len(time_ranges) and frame_time >= time_ranges[range_idx][1]:
+                while range_idx < len(frame_ranges) and src_frame_count >= frame_ranges[range_idx][1]:
                     range_idx += 1
 
                 # If we've passed all ranges, stop processing.
-                if range_idx >= len(time_ranges):
+                if range_idx >= len(frame_ranges):
                     break
 
                 # Check if frame is in current range.
-                start_ts, end_ts = time_ranges[range_idx]
-                if frame_time < start_ts:
+                start_frame = frame_ranges[range_idx][0]
+
+                if src_frame_count < start_frame:
+                    src_frame_count += 1
                     continue
-=======
-            # Check if frame is in any of our desired frame ranges.
-            # Skip ranges that have already passed.
-            while range_idx < len(frame_ranges) and src_frame_count >= frame_ranges[range_idx][1]:
-                range_idx += 1
-
-            # If we've passed all ranges, stop processing.
-            if range_idx >= len(frame_ranges):
-                break
-
-            # Check if frame is in current range.
-            start_frame = frame_ranges[range_idx][0]
-
-            if src_frame_count < start_frame:
-                src_frame_count += 1
-                continue
->>>>>>> upstream/main
 
                 # Frame is in range - create a new frame with reset timestamps.
                 # We need to create a copy to avoid modifying the original.
@@ -694,12 +665,8 @@ def _keep_episodes_from_video_with_av(
                 for pkt in v_out.encode(new_frame):
                     out.mux(pkt)
 
-<<<<<<< HEAD
+                src_frame_count += 1
                 frame_count += 1
-=======
-            src_frame_count += 1
-            frame_count += 1
->>>>>>> upstream/main
 
         # Flush encoder.
         for pkt in v_out.encode():

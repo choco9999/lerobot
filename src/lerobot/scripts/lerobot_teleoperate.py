@@ -94,10 +94,7 @@ from lerobot.teleoperators import (  # noqa: F401
     make_teleoperator_from_config,
     omx_leader,
     openarm_leader,
-<<<<<<< HEAD
-=======
     openarm_mini,
->>>>>>> upstream/main
     reachy2_teleoperator,
     so_leader,
     unitree_g1,

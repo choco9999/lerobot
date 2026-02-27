@@ -61,10 +61,7 @@ from lerobot.teleoperators import (  # noqa: F401
     make_teleoperator_from_config,
     omx_leader,
     openarm_leader,
-<<<<<<< HEAD
-=======
     openarm_mini,
->>>>>>> upstream/main
     so_leader,
 )
 from lerobot.utils.robot_utils import precise_sleep

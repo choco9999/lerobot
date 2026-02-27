@@ -37,12 +37,8 @@ def _frame_id(model, name: str) -> int | None:
     try:
         fid = model.getFrameId(name)
         return fid if 0 <= fid < model.nframes else None
-<<<<<<< HEAD
     except Exception as e:
         logger.debug(f"Failed to get frame ID for '{name}': {type(e).__name__}: {e}")
-=======
-    except Exception:
->>>>>>> upstream/main
         return None
 
 

@@ -95,13 +95,10 @@ def make_teleoperator_from_config(config: TeleoperatorConfig) -> "Teleoperator":
         from .bi_openarm_leader import BiOpenArmLeader
 
         return BiOpenArmLeader(config)
-<<<<<<< HEAD
-=======
     elif config.type == "openarm_mini":
         from .openarm_mini import OpenArmMini
 
         return OpenArmMini(config)
->>>>>>> upstream/main
     else:
         try:
             return cast("Teleoperator", make_device_from_device_class(config))

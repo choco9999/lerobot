@@ -152,10 +152,7 @@ def test_motor(bus, motor_id: int, timeout: float, use_fd: bool):
     )
     try:
         bus.send(disable_msg)
-<<<<<<< HEAD
-=======
         bus.recv(timeout=0.1)  # Clear any pending responses
->>>>>>> upstream/main
     except Exception:
         print(f"Error sending message to motor 0x{motor_id:02X}")
 
