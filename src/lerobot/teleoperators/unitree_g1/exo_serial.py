@@ -32,6 +32,7 @@ def parse_raw16(line: bytes) -> list[int] | None:
         if len(parts) < 16:
             return None
         return [int(x) for x in parts[:16]]
+<<<<<<< HEAD
     except (ValueError, UnicodeDecodeError) as e:
         # Log parsing errors but continue - sensor data might be corrupted
         logger.debug(f"Failed to parse raw sensor data: {type(e).__name__}: {e}")
@@ -39,6 +40,9 @@ def parse_raw16(line: bytes) -> list[int] | None:
     except Exception as e:
         # Catch unexpected exceptions to prevent crashes
         logger.warning(f"Unexpected error parsing raw sensor data: {type(e).__name__}: {e}")
+=======
+    except Exception:
+>>>>>>> upstream/main
         return None
 
 

@@ -15,14 +15,20 @@
 # limitations under the License.
 
 import abc
+<<<<<<< HEAD
 import logging
+=======
+>>>>>>> upstream/main
 import warnings
 from typing import Any
 
 from numpy.typing import NDArray  # type: ignore  # TODO: add type stubs for numpy.typing
 
+<<<<<<< HEAD
 logger = logging.getLogger(__name__)
 
+=======
+>>>>>>> upstream/main
 from .configs import CameraConfig
 
 
@@ -75,9 +81,14 @@ class Camera(abc.ABC):
         try:
             if self.is_connected:
                 self.disconnect()
+<<<<<<< HEAD
         except Exception as e:  # nosec B110
             # Log but don't raise in destructor to avoid potential issues during cleanup
             logger.warning(f"Failed to disconnect camera in destructor: {type(e).__name__}: {e}")
+=======
+        except Exception:  # nosec B110
+            pass
+>>>>>>> upstream/main
 
     @property
     @abc.abstractmethod

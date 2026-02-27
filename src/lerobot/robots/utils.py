@@ -68,10 +68,13 @@ def make_robot_from_config(config: RobotConfig) -> Robot:
         from .bi_openarm_follower import BiOpenArmFollower
 
         return BiOpenArmFollower(config)
+<<<<<<< HEAD
     elif config.type == "yaskawa_nhc12":
         from .yaskawa_nhc12 import YaskawaNHC12Robot
 
         return YaskawaNHC12Robot(config)
+=======
+>>>>>>> upstream/main
     elif config.type == "mock_robot":
         from tests.mocks.mock_robot import MockRobot
 
