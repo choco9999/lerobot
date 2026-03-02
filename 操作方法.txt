@@ -1,0 +1,127 @@
+[前準備]
+source venv/bin/activate
+sudo chmod 777 -R /dev
+
+
+[SARM学習]
+ACTと一緒
+
+
+[SARM RA-BC重み計算]
+MPLBACKEND=Agg python /content/lerobot/src/lerobot/policies/sarm/compute_rabc_weights.py \
+  --dataset.repo_id=chocolat-nya/home_handkerchief_folding_20260217 \
+  --policy.repo_id=chocolat-nya/home_handkerchief_folding_20260217 \
+  --policy.image_key=observation.images.left_rear
+
+
+[pi05_train]
+pip install "transformers @ git+https://github.com/huggingface/transformers.git@fix/lerobot_openpi" "scipy>=1.10.1,<1.15"
+
+sudo rm -rf ~/.cache/huggingface/lerobot/chocolat-nya/eval_pi05_handkerchief
+
+lerobot-train \
+  --policy.type=pi05 \
+  --dataset.repo_id=chocolat-nya/home_handkerchief_folding_20260217 \
+  --policy.repo_id=chocolat-nya/pi05_home_handkerchief_folding \
+  --use_rabc=true \
+  --policy.device=cuda \
+  --batch_size=2 \
+  --output_dir=outputs/train/pi05_handkerchief \
+  --job_name=pi05_handkerchief
+
+
+[pi05_predict]
+lerobot-record \
+  --robot.type=bi_so_follower \
+  --robot.id=bi_so \
+  --robot.left_arm_config.port=/dev/ttyACM2 \
+  --robot.right_arm_config.port=/dev/ttyACM3 \
+  --robot.left_arm_config.cameras='{"rear": {"type": "opencv", "index_or_path": 4, "width": 640, "height": 480, "fps": 30}, "side": {"type": "opencv", "index_or_path": 2, "width": 640, "height": 480, "fps": 30}}' \
+  --policy.path=chocolat-nya/pi05_home_handkerchief_folding \
+  --dataset.repo_id=chocolat-nya/eval_pi05_handkerchief \
+  --dataset.single_task="ハンカチを折りたたむ" \
+  --dataset.num_episodes=10 \
+  --dataset.episode_time_s=30 \
+  --dataset.reset_time_s=5
+
+
+[dataset]
+lerobot-record \
+  --robot.type=so101_follower \
+  --robot.port=/dev/ttyACM1 \
+  --teleop.type=so101_leader \
+  --teleop.port=/dev/ttyACM0 \
+  --robot.cameras="{
+    front: {type: opencv, index_or_path: 2, width: 640, height: 480, fps: 30},
+    wrist: {type: opencv, index_or_path: 4, width: 640, height: 480, fps: 10}
+  }" \
+  --dataset.repo_id=chocolat-nya/cring_home_202601204 \
+  --dataset.single_task="cring_home: pick and place" \
+  --dataset.num_episodes=100 \
+  --dataset.episode_time_s=30 \
+  --dataset.reset_time_s=10 \
+  --resume=true
+
+
+[twin arms dataset]
+sudo rm -R /home/kazu/.cache/huggingface/lerobot/chocolat-nya/home_handkerchief_folding_20260301
+
+lerobot-record \
+  --dataset.repo_id=chocolat-nya/home_handkerchief_folding_20260301 \
+  --dataset.single_task=true \
+  --robot.type=bi_so_follower \
+  --robot.id=bi_so \
+  --robot.left_arm_config.port=/dev/ttyACM2 \
+  --robot.right_arm_config.port=/dev/ttyACM3 \
+  --robot.left_arm_config.cameras='{"rear": {"type": "opencv", "index_or_path": 4, "width": 640, "height": 480, "fps": 30}, "side": {"type": "opencv", "index_or_path": 2, "width": 640, "height": 480, "fps": 20}}' \
+  --teleop.type=bi_so_leader \
+  --teleop.id=bi_so_leader \
+  --teleop.left_arm_config.port=/dev/ttyACM0 \
+  --teleop.right_arm_config.port=/dev/ttyACM1 \
+  --dataset.num_episodes=100 \
+  --dataset.episode_time_s=30 \
+  --dataset.reset_time_s=5 \
+  --resume=true
+
+
+[ACT推論]
+lerobot-record \
+  --robot.type=so101_follower \
+  --robot.port=/dev/ttyACM1 \
+  --robot.id=my_follower_arm \
+  --robot.cameras="{
+    front: {type: opencv, index_or_path: 2, width: 640, height: 480, fps: 30},
+    wrist: {type: opencv, index_or_path: 4, width: 640, height: 480, fps: 10}
+  }" \
+  --display_data=false \
+  --dataset.repo_id=chocolat-nya/eval_inference_logs_20260124 \
+  --dataset.single_task="cring_home: act_inference" \
+  --dataset.num_episodes=1 \
+  --dataset.episode_time_s=30 \
+  --dataset.push_to_hub=false \
+  --policy.path=chocolat-nya/cring_home_202601204 \
+  --policy.device=cuda
+  
+ [hil-serl(JAX)]
+python -m lerobot.rl.learner --config_path /home/kazu/lerobot/src/lerobot/configs/train_config_hilserl_so101.json
+python -m lerobot.rl.actor --config_path /home/kazu/lerobot/src/lerobot/configs/train_config_hilserl_so101.json
+
+[SARM]
+python src/lerobot/policies/sarm/compute_rabc_weights.py \
+  --dataset-repo-id chocolat-nya/cring_home_202601204 \
+  --reward-model-path chocolat-nya/cring_sarm_20260124 \
+  --visualize-only \
+  --num-visualizations 5 \
+  --head-mode sparse \
+  --output-dir ./sarm_viz
+
+[tele_operation]
+lerobot-teleoperate \
+  --robot.type=bi_so_follower \
+  --robot.left_arm_config.port=/dev/ttyACM2 \
+  --robot.right_arm_config.port=/dev/ttyACM3 \
+  --robot.id=my_bimanual_follower \
+  --teleop.type=bi_so_leader \
+  --teleop.left_arm_config.port=/dev/ttyACM0 \
+  --teleop.right_arm_config.port=/dev/ttyACM1 \
+  --teleop.id=my_bimanual_leader

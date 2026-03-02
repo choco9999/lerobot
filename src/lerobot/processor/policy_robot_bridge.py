@@ -68,10 +68,7 @@ class PolicyActionToRobotActionProcessorStep(ActionProcessorStep):
         action_len = len(action)
         expected_len = len(self.motor_names)
         if expected_len != action_len:
-            raise ValueError(
-                f"Action length mismatch: expected {expected_len} elements for motors {self.motor_names}, "
-                f"got {action_len} elements"
-            )
+            raise ValueError(f"Action must have {expected_len} elements, got {action_len}")
         return {f"{name}.pos": action[i] for i, name in enumerate(self.motor_names)}
 
     def get_config(self) -> dict[str, Any]:
