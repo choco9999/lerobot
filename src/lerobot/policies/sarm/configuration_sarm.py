@@ -21,6 +21,7 @@ Paper: https://arxiv.org/abs/2509.25358
 """
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
@@ -49,6 +50,10 @@ class SARMConfig(PreTrainedConfig):
     The annotation_mode determines how sparse_temporal_proportions and dense_temporal_proportions
     are loaded/generated during model initialization.
     """
+
+    # Public SARM checkpoint used as default initialization when users pass `--policy.type=sarm`.
+    # To train from scratch, set `--policy.pretrained_path=null`.
+    pretrained_path: Path | None = Path("lerobot-data-collection/level2_sarm9")
 
     annotation_mode: str = "single_stage"  # "single_stage", "dense_only", or "dual"
     n_obs_steps: int = 8  # Number of observation history steps
@@ -85,6 +90,7 @@ class SARMConfig(PreTrainedConfig):
     dense_subtask_names: list | None = None
     dense_temporal_proportions: list | None = None
 
+    # Deprecated: kept for backward compatibility with older configs/checkpoints.
     pretrained_model_path: str | None = None
     device: str | None = None
     image_key: str = OBS_IMAGES + ".top"  # Key for image used from the dataset
@@ -112,6 +118,10 @@ class SARMConfig(PreTrainedConfig):
 
     def __post_init__(self):
         super().__post_init__()
+
+        # Backward compatibility: older configs stored `pretrained_model_path`.
+        if self.pretrained_model_path and self.pretrained_path is None:
+            self.pretrained_path = Path(self.pretrained_model_path)
 
         if self.annotation_mode not in ["single_stage", "dense_only", "dual"]:
             raise ValueError(

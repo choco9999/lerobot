@@ -263,6 +263,10 @@ This generates visualizations showing video frames with subtask boundaries overl
 
 ## Step 3: Train SARM
 
+By default, SARM starts from the public pretrained checkpoint
+`lerobot-data-collection/level2_sarm9`. To train fully from scratch, set
+`--policy.pretrained_path=null`.
+
 <hfoptions id="train_mode">
 <hfoption id="single_stage">
 
@@ -323,6 +327,25 @@ lerobot-train \
 </hfoption>
 </hfoptions>
 
+### Fine-tune from a Pretrained SARM
+
+To continue training from a SARM model already on the Hugging Face Hub (or from a local checkpoint), pass
+`--policy.path`. The loaded policy config is reused, and CLI args override only what you set.
+
+```bash
+lerobot-train \
+  --policy.path=your-username/your-pretrained-sarm \
+  --dataset.repo_id=your-username/your-new-dataset \
+  --output_dir=outputs/train/sarm_finetune \
+  --batch_size=32 \
+  --steps=5000 \
+  --wandb.enable=true \
+  --wandb.project=sarm
+```
+
+If you want to override mode-specific settings while fine-tuning, add them explicitly (for example
+`--policy.annotation_mode=dual` and `--policy.image_key=observation.images.base`).
+
 ### Multi-GPU Training
 
 Add `accelerate launch --multi_gpu --num_processes=4` to use multiple GPUs for training.
@@ -336,6 +359,7 @@ Add `accelerate launch --multi_gpu --num_processes=4` to use multiple GPUs for t
 | `--policy.state_key`       | Key for joint states                                              | `observation.state`      |
 | `--policy.n_obs_steps`     | Observation history steps (total obs frames = `n_obs_steps + 1`)  | `8`                      |
 | `--policy.frame_gap`       | Gap (in frames) between sampled observations (at 30 fps: 30 ≈ 1s) | `30`                     |
+| `--policy.pretrained_path` | Hub model or local checkpoint used to initialize SARM              | `lerobot-data-collection/level2_sarm9` |
 
 ---
 

@@ -97,6 +97,50 @@ class MockConfig:
         return 1 + self.n_obs_steps + self.max_rewind_steps
 
 
+def test_sarm_preprocessor_reload_from_pretrained_for_finetuning(tmp_path):
+    """SARM preprocessor should round-trip through save/load when using pretrained policy loading."""
+    from lerobot.policies.factory import make_pre_post_processors
+    from lerobot.policies.sarm.configuration_sarm import SARMConfig
+    from lerobot.policies.sarm.processor_sarm import (
+        SARMEncodingProcessorStep,
+        make_sarm_pre_post_processors,
+    )
+
+    with (
+        patch("lerobot.policies.sarm.processor_sarm.CLIPModel") as mock_model_cls,
+        patch("lerobot.policies.sarm.processor_sarm.CLIPProcessor") as mock_processor_cls,
+    ):
+        mock_model = MagicMock()
+        mock_model.to.return_value = mock_model
+        mock_model.eval.return_value = mock_model
+        mock_model_cls.from_pretrained.return_value = mock_model
+        mock_processor_cls.from_pretrained.return_value = MagicMock()
+
+        config = SARMConfig(
+            annotation_mode="single_stage",
+            device="cpu",
+            n_obs_steps=2,
+            max_rewind_steps=1,
+            frame_gap=1,
+            clip_batch_size=2,
+        )
+        preprocessor, _ = make_sarm_pre_post_processors(config=config, dataset_stats=None, dataset_meta=None)
+        preprocessor.save_pretrained(tmp_path)
+
+        loaded_preprocessor, _ = make_pre_post_processors(
+            policy_cfg=config,
+            pretrained_path=str(tmp_path),
+            dataset_stats=None,
+            dataset_meta=None,
+        )
+
+        sarm_steps = [step for step in loaded_preprocessor.steps if isinstance(step, SARMEncodingProcessorStep)]
+        assert len(sarm_steps) == 1
+        assert isinstance(sarm_steps[0].config, SARMConfig)
+        assert sarm_steps[0].config.n_obs_steps == config.n_obs_steps
+        assert sarm_steps[0].config.annotation_mode == config.annotation_mode
+
+
 class TestSARMEncodingProcessorStepEndToEnd:
     """End-to-end test for SARMEncodingProcessorStep with dummy batch data."""
 

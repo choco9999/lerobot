@@ -53,17 +53,57 @@ from lerobot.processor.pipeline import PipelineFeatureType
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
 
 
+SARM_SERIALIZABLE_CONFIG_FIELDS = (
+    "annotation_mode",
+    "n_obs_steps",
+    "frame_gap",
+    "max_rewind_steps",
+    "image_dim",
+    "text_dim",
+    "hidden_dim",
+    "num_heads",
+    "num_layers",
+    "max_state_dim",
+    "drop_n_last_frames",
+    "batch_size",
+    "clip_batch_size",
+    "dropout",
+    "stage_loss_weight",
+    "rewind_probability",
+    "language_perturbation_probability",
+    "num_sparse_stages",
+    "sparse_subtask_names",
+    "sparse_temporal_proportions",
+    "num_dense_stages",
+    "dense_subtask_names",
+    "dense_temporal_proportions",
+    "device",
+    "image_key",
+    "state_key",
+)
+
+
+def serialize_sarm_config(config: SARMConfig) -> dict[str, Any]:
+    """Serialize the subset of SARM config needed by the encoding processor."""
+    return {key: getattr(config, key) for key in SARM_SERIALIZABLE_CONFIG_FIELDS}
+
+
 class SARMEncodingProcessorStep(ProcessorStep):
     """ProcessorStep that encodes images and text with CLIP and generates stage and progress labels for SARM."""
 
     def __init__(
         self,
-        config: SARMConfig,
+        config: SARMConfig | dict[str, Any] | None = None,
         image_key: str | None = None,
         dataset_meta=None,
         dataset_stats: dict | None = None,
     ):
         super().__init__()
+        if config is None:
+            config = SARMConfig()
+        elif isinstance(config, dict):
+            config = SARMConfig(**config)
+
         self.config = config
         self.image_key = image_key or config.image_key
         self.dataset_meta = dataset_meta
@@ -99,6 +139,13 @@ class SARMEncodingProcessorStep(ProcessorStep):
 
         self.verbs = ["move", "grasp", "rotate", "push", "pull", "slide", "lift", "place"]
         self.fake = Faker()
+
+    def get_config(self) -> dict[str, Any]:
+        """Save enough configuration to reconstruct this step from pretrained processors."""
+        return {
+            "config": serialize_sarm_config(self.config),
+            "image_key": self.image_key,
+        }
 
     def _find_episode_for_frame(self, frame_idx: int) -> int:
         """Find the episode index for a given frame index."""

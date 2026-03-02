@@ -209,6 +209,7 @@ class ProcessorConfigKwargs(TypedDict, total=False):
     preprocessor_overrides: dict[str, Any] | None
     postprocessor_overrides: dict[str, Any] | None
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None
+    dataset_meta: LeRobotDatasetMetadata | None
 
 
 def make_pre_post_processors(
@@ -242,12 +243,13 @@ def make_pre_post_processors(
             policy configuration type.
     """
     if pretrained_path:
+        preprocessor_overrides = dict(kwargs.get("preprocessor_overrides", {}) or {})
+        postprocessor_overrides = dict(kwargs.get("postprocessor_overrides", {}) or {})
+
         # TODO(Steven): Temporary patch, implement correctly the processors for Gr00t
         if isinstance(policy_cfg, GrootConfig):
             # GROOT handles normalization in groot_pack_inputs_v3 step
             # Need to override both stats AND normalize_min_max since saved config might be empty
-            preprocessor_overrides = {}
-            postprocessor_overrides = {}
             preprocessor_overrides["groot_pack_inputs_v3"] = {
                 "stats": kwargs.get("dataset_stats"),
                 "normalize_min_max": True,
@@ -260,8 +262,21 @@ def make_pre_post_processors(
                 "normalize_min_max": True,
                 "env_action_dim": env_action_dim,
             }
-            kwargs["preprocessor_overrides"] = preprocessor_overrides
-            kwargs["postprocessor_overrides"] = postprocessor_overrides
+
+        if isinstance(policy_cfg, SARMConfig):
+            # Ensure SARM encoding step can always be reconstructed for fine-tuning from a pretrained checkpoint.
+            sarm_overrides = {
+                "config": policy_cfg,
+                "dataset_meta": kwargs.get("dataset_meta"),
+                "dataset_stats": kwargs.get("dataset_stats"),
+            }
+            preprocessor_overrides["SARMEncodingProcessorStep"] = {
+                **preprocessor_overrides.get("SARMEncodingProcessorStep", {}),
+                **sarm_overrides,
+            }
+
+        kwargs["preprocessor_overrides"] = preprocessor_overrides
+        kwargs["postprocessor_overrides"] = postprocessor_overrides
 
         return (
             PolicyProcessorPipeline.from_pretrained(
