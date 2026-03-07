@@ -49,7 +49,7 @@ def _make_bus_mock() -> MagicMock:
 
 
 @pytest.fixture
-def follower():
+def follower(tmp_path):
     bus_mock = _make_bus_mock()
 
     def _bus_side_effect(*_args, **kwargs):
@@ -71,7 +71,11 @@ def follower():
         ),
         patch.object(SO100Follower, "configure", lambda self: None),
     ):
-        cfg = SO100FollowerConfig(port="/dev/null")
+        cfg = SO100FollowerConfig(
+            id="test_so100_follower",
+            calibration_dir=tmp_path,
+            port="/dev/null",
+        )
         robot = SO100Follower(cfg)
         yield robot
         if robot.is_connected:
@@ -109,3 +113,22 @@ def test_send_action(follower):
 
     goal_pos = {m: (i + 1) * 10 for i, m in enumerate(follower.bus.motors)}
     follower.bus.sync_write.assert_called_once_with("Goal_Position", goal_pos)
+
+
+def test_calibrate_records_wrist_roll_range(follower):
+    follower.bus.set_half_turn_homings.return_value = {
+        motor: idx * 100 for idx, motor in enumerate(follower.bus.motors, 1)
+    }
+    range_mins = {motor: idx * 10 for idx, motor in enumerate(follower.bus.motors, 1)}
+    range_maxes = {motor: value + 50 for motor, value in range_mins.items()}
+    follower.bus.record_ranges_of_motion.return_value = (range_mins, range_maxes)
+
+    with (
+        patch("builtins.input", return_value=""),
+        patch.object(SO100Follower, "_save_calibration", autospec=True),
+    ):
+        follower.calibrate()
+
+    follower.bus.record_ranges_of_motion.assert_called_once_with()
+    assert follower.calibration["wrist_roll"].range_min == range_mins["wrist_roll"]
+    assert follower.calibration["wrist_roll"].range_max == range_maxes["wrist_roll"]
