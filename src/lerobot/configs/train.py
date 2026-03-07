@@ -31,6 +31,9 @@ from lerobot.optim.schedulers import LRSchedulerConfig
 from lerobot.utils.hub import HubMixin
 
 TRAIN_CONFIG_NAME = "train_config.json"
+RABC_DEFAULT_PRETRAINED_POLICIES = {
+    "pi05": Path("lerobot/pi05_base"),
+}
 
 
 @dataclass
@@ -147,6 +150,11 @@ class TrainPipelineConfig(HubMixin):
                 self.rabc_progress_path = str(Path(self.dataset.root) / "sarm_progress.parquet")
             else:
                 self.rabc_progress_path = f"hf://datasets/{repo_id}/sarm_progress.parquet"
+
+        if self.use_rabc and self.policy.pretrained_path is None:
+            default_pretrained_path = RABC_DEFAULT_PRETRAINED_POLICIES.get(self.policy.type)
+            if default_pretrained_path is not None:
+                self.policy.pretrained_path = default_pretrained_path
 
     @classmethod
     def __get_path_fields__(cls) -> list[str]:
