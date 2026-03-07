@@ -3,7 +3,7 @@ source venv/bin/activate
 sudo chmod 777 -R /dev
 
 
-[twin arms dataset]
+[1.twin arms dataset]
 sudo rm -R /home/kazu/.cache/huggingface/lerobot/chocolat-nya/home_handkerchief_folding_20260307
 
 lerobot-record \
@@ -24,16 +24,28 @@ lerobot-record \
   --dataset.reset_time_s=5 \
   --resume=true
 
-[SARM学習]
-MPLBACKEND=Agg python src/lerobot/policies/sarm/compute_rabc_weights.py \
+
+[2.SARM を事前学習済みから学習する]
+lerobot-train \
+  --dataset.repo_id=chocolat-nya/home_handkerchief_folding_20260307 \
+  --policy.type=sarm \
+  --policy.annotation_mode=single_stage \
+  --policy.image_key=observation.images.base \
+  --policy.push_to_hub=false \
+  --output_dir=outputs/train/sarm \
+  --batch_size=32 \
+  --steps=5000
+
+
+[3.SARM で progress を計算する]
+python src/lerobot/policies/sarm/compute_rabc_weights.py \
   --dataset-repo-id=chocolat-nya/home_handkerchief_folding_20260307 \
-  --reward-model-path=chocolat-nya/home_handkerchief_sarm_20260307
+  --reward-model-path=outputs/train/sarm/checkpoints/last/pretrained_model \
   --head-mode=sparse \
-  --num-visualizations=5 \
-  --output-dir=./sarm_viz
+  --num-visualizations=5
 
 
-[pi05_train]
+[4.PI05 を RA-BC 付きで事前学習済みから学習する]
 pip install "transformers @ git+https://github.com/huggingface/transformers.git@fix/lerobot_openpi" "scipy>=1.10.1,<1.15"
 
 sudo rm -rf ~/.cache/huggingface/lerobot/chocolat-nya/eval_pi05_handkerchief
@@ -41,32 +53,30 @@ sudo rm -rf ~/.cache/huggingface/lerobot/chocolat-nya/eval_pi05_handkerchief
 lerobot-train \
   --dataset.repo_id=chocolat-nya/home_handkerchief_folding_20260307 \
   --policy.type=pi05 \
-  --policy.pretrained_path=lerobot/pi05_base \
-  --policy.repo_id=chocolat-nya/pi05_home_handkerchief_folding \
   --use_rabc=true \
   --rabc_head_mode=sparse \
   --rabc_kappa=0.01 \
-  --policy.device=cuda \
-  --batch_size=2 \
-  --steps=3000 \
-  --output_dir=outputs/train/pi05_handkerchief \
-  --job_name=pi05_handkerchief
+  --policy.push_to_hub=false \
+  --output_dir=outputs/train/pi05_rabc \
+  --batch_size=32 \
+  --steps=40000
 
 
-
-[pi05_predict]
+[5.pi05_predict]
 lerobot-record \
-  --robot.type=bi_so_follower \
-  --robot.id=bi_so \
-  --robot.left_arm_config.port=/dev/ttyACM2 \
-  --robot.right_arm_config.port=/dev/ttyACM3 \
-  --robot.left_arm_config.cameras='{"rear": {"type": "opencv", "index_or_path": 4, "width": 640, "height": 480, "fps": 30}, "side": {"type": "opencv", "index_or_path": 2, "width": 640, "height": 480, "fps": 30}}' \
-  --policy.path=chocolat-nya/pi05_home_handkerchief_folding \
-  --dataset.repo_id=chocolat-nya/eval_pi05_handkerchief \
-  --dataset.single_task="ハンカチを折りたたむ" \
+  --robot.type=so101_follower \
+  --robot.port=/dev/ttyACM0 \
+  --robot.id=my_so101_follower \
+  --robot.cameras="{ rear: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}, side: {type: opencv, index_or_path: 1, width: 640, height: 480, fps: 30}}" \
+  --dataset.single_task="Pick up the block and place it in the bin." \
+  --dataset.repo_id=chocolat-nya/home_handkerchief_folding_20260307 \
+  --dataset.episode_time_s=50 \
   --dataset.num_episodes=10 \
-  --dataset.episode_time_s=30 \
-  --dataset.reset_time_s=5
+  --dataset.streaming_encoding=true \
+  --dataset.encoder_threads=2 \
+  --policy.path=chocolat-nya/home_handkerchief_folding_20260307
+
+
 
 
 [dataset]
@@ -104,8 +114,9 @@ lerobot-record \
   --dataset.push_to_hub=false \
   --policy.path=chocolat-nya/cring_home_202601204 \
   --policy.device=cuda
-  
- [hil-serl(JAX)]
+
+
+[hil-serl(JAX)]
 python -m lerobot.rl.learner --config_path /home/kazu/lerobot/src/lerobot/configs/train_config_hilserl_so101.json
 python -m lerobot.rl.actor --config_path /home/kazu/lerobot/src/lerobot/configs/train_config_hilserl_so101.json
 
